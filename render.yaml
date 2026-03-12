@@ -3,6 +3,7 @@ services:
     name: jiayuan-group-app
     runtime: python
     plan: starter
+    autoDeploy: false
     buildCommand: "python -m py_compile server.py"
     startCommand: "python server.py"
     disk:
