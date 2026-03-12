@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>家园集团后台</title>
+  <style>
+    :root {
+      --bg: #f4f6fb;
+      --panel: rgba(255, 255, 255, 0.96);
+      --line: #e4e9f4;
+      --ink: #1f2843;
+      --muted: #74809c;
+      --primary: #2f6df6;
+      --primary-soft: #edf3ff;
+      --danger: #cf4266;
+      --danger-soft: #fff0f4;
+      --success: #13795b;
+      --shadow: 0 24px 70px rgba(33, 53, 107, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(60, 120, 255, 0.14), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(255, 126, 160, 0.12), transparent 28%),
+        linear-gradient(180deg, #f8faff 0%, #eef2fb 100%);
+      padding: 20px;
+    }
+
+    .wrap {
+      max-width: 1120px;
+      margin: 0 auto;
+    }
+
+    .hero {
+      margin-bottom: 18px;
+    }
+
+    .hero h1 {
+      margin: 0;
+      font-size: 34px;
+      letter-spacing: 0.02em;
+    }
+
+    .hero p {
+      margin: 10px 0 0;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+
+    .panel,
+    .login-card,
+    .toolbar {
+      background: var(--panel);
+      border: 1px solid rgba(228, 233, 244, 0.9);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    .login-card {
+      max-width: 460px;
+      margin: 48px auto 0;
+      padding: 26px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: var(--primary-soft);
+      color: var(--primary);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .login-card h2 {
+      margin: 18px 0 10px;
+      font-size: 28px;
+    }
+
+    .login-card p {
+      margin: 0 0 22px;
+      color: var(--muted);
+      line-height: 1.75;
+    }
+
+    form {
+      display: grid;
+      gap: 16px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .field label {
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .field input {
+      width: 100%;
+      padding: 13px 14px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      outline: none;
+      font-size: 15px;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .field input:focus {
+      border-color: rgba(47, 109, 246, 0.6);
+      box-shadow: 0 0 0 4px rgba(47, 109, 246, 0.12);
+    }
+
+    .hint,
+    .status {
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .hint {
+      color: var(--muted);
+    }
+
+    .status {
+      min-height: 24px;
+      color: var(--danger);
+    }
+
+    .status.success {
+      color: var(--success);
+    }
+
+    .actions,
+    .toolbar-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+
+    button,
+    .link-btn {
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 16px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      background: var(--primary);
+      color: #fff;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+
+    .ghost {
+      background: var(--primary-soft);
+      color: var(--primary);
+    }
+
+    .danger {
+      background: var(--danger-soft);
+      color: var(--danger);
+    }
+
+    .toolbar {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      padding: 18px;
+      margin-bottom: 18px;
+    }
+
+    .toolbar strong {
+      display: block;
+      font-size: 18px;
+      margin-bottom: 4px;
+    }
+
+    .toolbar span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .panel {
+      overflow: hidden;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      padding: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .stat {
+      border-radius: 18px;
+      padding: 16px;
+      background: linear-gradient(180deg, #fbfcff, #f1f5ff);
+      border: 1px solid #e7ebfb;
+    }
+
+    .stat span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .stat strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 28px;
+    }
+
+    .table-wrap {
+      overflow: auto;
+    }
+
+    table {
+      width: 100%;
+      min-width: 920px;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      background: #fafbff;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .empty,
+    .error {
+      padding: 24px 18px;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+
+    .error {
+      color: var(--danger);
+    }
+
+    @media (max-width: 760px) {
+      body {
+        padding: 14px;
+      }
+
+      .toolbar,
+      .toolbar-actions {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .stats {
+        grid-template-columns: 1fr;
+      }
+
+      .login-card {
+        margin-top: 24px;
+        padding: 22px 16px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="hero">
+      <h1>家园集团线索后台</h1>
+      <p>后台需要账号密码登录。登录后可以查看、导出和删除页面提交过的姓名与联系电话。</p>
+    </header>
+
+    <section class="login-card hidden" id="loginCard">
+      <div class="eyebrow">后台安全登录</div>
+      <h2>请输入账号密码</h2>
+      <p>后台数据只对已授权账号开放。登录成功后，系统会自动保持当前会话。</p>
+      <form id="loginForm" novalidate>
+        <div class="field">
+          <label for="usernameInput">账号</label>
+          <input id="usernameInput" type="text" autocomplete="username" placeholder="请输入后台账号">
+        </div>
+        <div class="field">
+          <label for="passwordInput">密码</label>
+          <input id="passwordInput" type="password" autocomplete="current-password" placeholder="请输入后台密码">
+        </div>
+        <div class="status" id="loginStatus"></div>
+        <div class="actions">
+          <button id="loginBtn" type="submit">登录后台</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="hidden" id="dashboard">
+      <section class="toolbar">
+        <div>
+          <strong id="welcomeText">已登录</strong>
+          <span>后台地址可以长期使用，退出后需要重新登录。</span>
+        </div>
+        <div class="toolbar-actions">
+          <a class="link-btn ghost" id="exportBtn" href="/api/export.csv" target="_blank" rel="noreferrer">导出 CSV</a>
+          <button class="ghost" id="refreshBtn" type="button">刷新数据</button>
+          <button class="danger" id="logoutBtn" type="button">退出登录</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="stats">
+          <div class="stat">
+            <span>总提交数</span>
+            <strong id="countAll">0</strong>
+          </div>
+          <div class="stat">
+            <span>今天新增</span>
+            <strong id="countToday">0</strong>
+          </div>
+          <div class="stat">
+            <span>最近一次提交</span>
+            <strong id="latestTime">-</strong>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>提交时间</th>
+                <th>姓名</th>
+                <th>联系电话</th>
+                <th>结果区间</th>
+                <th>女方信息</th>
+                <th>男方信息</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="tableBody">
+              <tr><td class="empty" colspan="7">正在加载数据...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const loginCard = document.getElementById("loginCard");
+    const dashboard = document.getElementById("dashboard");
+    const loginForm = document.getElementById("loginForm");
+    const loginBtn = document.getElementById("loginBtn");
+    const loginStatus = document.getElementById("loginStatus");
+    const usernameInput = document.getElementById("usernameInput");
+    const passwordInput = document.getElementById("passwordInput");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const logoutBtn = document.getElementById("logoutBtn");
+    const exportBtn = document.getElementById("exportBtn");
+    const welcomeText = document.getElementById("welcomeText");
+    const tableBody = document.getElementById("tableBody");
+    const countAll = document.getElementById("countAll");
+    const countToday = document.getElementById("countToday");
+    const latestTime = document.getElementById("latestTime");
+
+    refreshBtn.addEventListener("click", loadData);
+    logoutBtn.addEventListener("click", logout);
+    loginForm.addEventListener("submit", login);
+
+    bootstrap();
+
+    async function bootstrap() {
+      await checkSession();
+    }
+
+    async function checkSession() {
+      try {
+        const response = await fetch("/api/admin/session", {
+          headers: { "Cache-Control": "no-store" }
+        });
+        const data = await response.json();
+        if (data.authenticated) {
+          showDashboard(data.username || "管理员");
+          await loadData();
+          return;
+        }
+      } catch (error) {
+        // ignore bootstrap errors and fall back to login view
+      }
+      showLogin();
+    }
+
+    async function login(event) {
+      event.preventDefault();
+      setLoginStatus("", false);
+
+      const username = usernameInput.value.trim();
+      const password = passwordInput.value.trim();
+      if (!username || !password) {
+        setLoginStatus("请输入账号和密码。", false);
+        return;
+      }
+
+      loginBtn.disabled = true;
+      try {
+        const response = await fetch("/api/admin/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || "登录失败");
+        }
+        passwordInput.value = "";
+        setLoginStatus("登录成功，正在进入后台。", true);
+        showDashboard(data.username || username);
+        await loadData();
+      } catch (error) {
+        setLoginStatus(error.message || "登录失败", false);
+      } finally {
+        loginBtn.disabled = false;
+      }
+    }
+
+    async function logout() {
+      try {
+        await fetch("/api/admin/logout", { method: "POST" });
+      } catch (error) {
+        // ignore logout errors
+      }
+      showLogin();
+      usernameInput.focus();
+    }
+
+    function showLogin() {
+      loginCard.classList.remove("hidden");
+      dashboard.classList.add("hidden");
+      tableBody.innerHTML = '<tr><td class="empty" colspan="7">请先登录后台。</td></tr>';
+      countAll.textContent = "0";
+      countToday.textContent = "0";
+      latestTime.textContent = "-";
+      setLoginStatus("", false);
+    }
+
+    function showDashboard(username) {
+      loginCard.classList.add("hidden");
+      dashboard.classList.remove("hidden");
+      welcomeText.textContent = `${username}，欢迎回来`;
+    }
+
+    function setLoginStatus(message, success) {
+      loginStatus.textContent = message;
+      loginStatus.classList.toggle("success", Boolean(success));
+    }
+
+    async function loadData() {
+      tableBody.innerHTML = '<tr><td class="empty" colspan="7">正在加载数据...</td></tr>';
+
+      try {
+        const response = await fetch("/api/submissions", {
+          headers: { "Cache-Control": "no-store" }
+        });
+        const data = await response.json();
+        if (response.status === 401) {
+          showLogin();
+          setLoginStatus("登录状态已失效，请重新登录。", false);
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(data.error || "读取失败");
+        }
+        renderTable(data.items);
+      } catch (error) {
+        tableBody.innerHTML = `<tr><td class="error" colspan="7">${escapeHtml(error.message || "读取失败")}</td></tr>`;
+        countAll.textContent = "0";
+        countToday.textContent = "0";
+        latestTime.textContent = "-";
+      }
+    }
+
+    function renderTable(items) {
+      countAll.textContent = String(items.length);
+      const today = new Date().toISOString().slice(0, 10);
+      countToday.textContent = String(items.filter((item) => item.created_at.startsWith(today)).length);
+      latestTime.textContent = items.length ? formatTime(items[0].created_at) : "-";
+
+      if (!items.length) {
+        tableBody.innerHTML = '<tr><td class="empty" colspan="7">还没有提交记录。</td></tr>';
+        return;
+      }
+
+      tableBody.innerHTML = items.map((item) => `
+        <tr>
+          <td>${escapeHtml(formatTime(item.created_at))}</td>
+          <td>${escapeHtml(item.name)}</td>
+          <td>${escapeHtml(item.phone)}</td>
+          <td>${escapeHtml(item.score_range || "-")}</td>
+          <td>${escapeHtml(`年龄 ${item.female_age} / 体重 ${item.female_weight}kg / 孕史 ${item.pregnancy_history_label}`)}</td>
+          <td>${escapeHtml(`年龄 ${item.male_age} / 体重 ${item.male_weight}kg`)}</td>
+          <td><button class="danger" type="button" onclick="deleteItem(${item.id})">删除</button></td>
+        </tr>
+      `).join("");
+    }
+
+    async function deleteItem(id) {
+      const ok = window.confirm("确定删除这条提交记录吗？删除后不能恢复。");
+      if (!ok) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/submissions/${id}`, { method: "DELETE" });
+        const data = await response.json();
+        if (response.status === 401) {
+          showLogin();
+          setLoginStatus("登录状态已失效，请重新登录。", false);
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(data.error || "删除失败");
+        }
+        await loadData();
+      } catch (error) {
+        window.alert(error.message || "删除失败");
+      }
+    }
+
+    function formatTime(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return value;
+      }
+      return date.toLocaleString("zh-CN", { hour12: false });
+    }
+
+    function escapeHtml(text) {
+      return String(text)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+  </script>
+</body>
+</html>

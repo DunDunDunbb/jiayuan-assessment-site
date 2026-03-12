@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: jiayuan-group-app
+    runtime: python
+    plan: starter
+    buildCommand: "python -m py_compile server.py"
+    startCommand: "python server.py"
+    disk:
+      name: jiayuan-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /opt/render/project/src/data
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: ADMIN_TOKEN
+        sync: false
