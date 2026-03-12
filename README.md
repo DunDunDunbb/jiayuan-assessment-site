@@ -1,5 +1,7 @@
 # 家园集团评估页
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/DunDunDunbb/jiayuan-assessment-site)
+
 这个目录现在包含三个主要部分：
 
 - `index.html`: 前台页面
