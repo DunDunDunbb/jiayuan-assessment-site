@@ -391,9 +391,11 @@
     const countAll = document.getElementById("countAll");
     const countToday = document.getElementById("countToday");
     const latestTime = document.getElementById("latestTime");
+    let csrfToken = "";
 
     refreshBtn.addEventListener("click", loadData);
     logoutBtn.addEventListener("click", logout);
+    exportBtn.addEventListener("click", exportCsv);
     loginForm.addEventListener("submit", login);
 
     bootstrap();
@@ -409,6 +411,7 @@
         });
         const data = await response.json();
         if (data.authenticated) {
+          csrfToken = data.csrfToken || "";
           showDashboard(data.username || "管理员");
           await loadData();
           return;
@@ -441,6 +444,7 @@
         if (!response.ok) {
           throw new Error(data.error || "登录失败");
         }
+        csrfToken = data.csrfToken || "";
         passwordInput.value = "";
         setLoginStatus("登录成功，正在进入后台。", true);
         showDashboard(data.username || username);
@@ -454,10 +458,14 @@
 
     async function logout() {
       try {
-        await fetch("/api/admin/logout", { method: "POST" });
+        await fetch("/api/admin/logout", {
+          method: "POST",
+          headers: authHeaders()
+        });
       } catch (error) {
         // ignore logout errors
       }
+      csrfToken = "";
       showLogin();
       usernameInput.focus();
     }
@@ -469,6 +477,7 @@
       countAll.textContent = "0";
       countToday.textContent = "0";
       latestTime.textContent = "-";
+      csrfToken = "";
       setLoginStatus("", false);
     }
 
@@ -539,11 +548,14 @@
       }
 
       try {
-        const response = await fetch(`/api/submissions/${id}`, { method: "DELETE" });
+        const response = await fetch(`/api/submissions/${id}`, {
+          method: "DELETE",
+          headers: authHeaders()
+        });
         const data = await response.json();
-        if (response.status === 401) {
+        if (response.status === 401 || response.status === 403) {
           showLogin();
-          setLoginStatus("登录状态已失效，请重新登录。", false);
+          setLoginStatus(data.error || "登录状态已失效，请重新登录。", false);
           return;
         }
         if (!response.ok) {
@@ -553,6 +565,45 @@
       } catch (error) {
         window.alert(error.message || "删除失败");
       }
+    }
+
+    async function exportCsv(event) {
+      event.preventDefault();
+
+      try {
+        const response = await fetch("/api/export.csv", {
+          method: "GET",
+          headers: authHeaders()
+        });
+        if (response.status === 401 || response.status === 403) {
+          const data = await response.json();
+          showLogin();
+          setLoginStatus(data.error || "登录状态已失效，请重新登录。", false);
+          return;
+        }
+        if (!response.ok) {
+          throw new Error("导出失败，请稍后再试。");
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "beijing-jiayuan-leads.csv";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+      } catch (error) {
+        window.alert(error.message || "导出失败");
+      }
+    }
+
+    function authHeaders(extraHeaders = {}) {
+      const headers = { ...extraHeaders };
+      if (csrfToken) {
+        headers["X-CSRF-Token"] = csrfToken;
+      }
+      return headers;
     }
 
     function formatTime(value) {

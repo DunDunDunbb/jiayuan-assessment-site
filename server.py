@@ -43,6 +43,7 @@ ADMIN_PATH = BASE_DIR / "admin.html"
 ASSETS_DIR = BASE_DIR / "assets"
 LOG_DIR = DB_DIR / "logs"
 BACKUP_DIR = DB_DIR / "backups"
+ALERTS_LOG_PATH = LOG_DIR / "alerts.log"
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me-before-deploy").strip() or "change-me-before-deploy"
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "local-dev-session-secret").encode("utf-8")
@@ -129,6 +130,19 @@ def log_event(level: str, event: str, **details) -> None:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
         # Logging should never break the request lifecycle.
+        return
+
+
+def log_alert(event: str, **details) -> None:
+    try:
+        payload = {
+            "timestamp": utc_iso(),
+            "event": event,
+            "details": details,
+        }
+        with ALERTS_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
         return
 
 
@@ -454,6 +468,11 @@ def sign_session(username: str, expires_at: int) -> str:
     return hmac.new(SESSION_SECRET, payload, hashlib.sha256).hexdigest()
 
 
+def sign_csrf(username: str, expires_at: int) -> str:
+    payload = f"csrf:{username}:{expires_at}".encode("utf-8")
+    return hmac.new(SESSION_SECRET, payload, hashlib.sha256).hexdigest()
+
+
 def build_session_cookie(handler: BaseHTTPRequestHandler, username: str, clear: bool = False) -> str:
     parts = [
         f"{SESSION_COOKIE_NAME}=",
@@ -474,6 +493,23 @@ def build_session_cookie(handler: BaseHTTPRequestHandler, username: str, clear: 
     return "; ".join(parts)
 
 
+def build_session_artifacts(handler: BaseHTTPRequestHandler, username: str) -> tuple[str, str]:
+    expires_at = int(datetime.now(timezone.utc).timestamp()) + SESSION_TTL_SECONDS
+    signature = sign_session(username, expires_at)
+    csrf_token = sign_csrf(username, expires_at)
+    token = f"{username}:{expires_at}:{signature}"
+    parts = [
+        f"{SESSION_COOKIE_NAME}={token}",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        f"Max-Age={SESSION_TTL_SECONDS}",
+    ]
+    if handler.headers.get("X-Forwarded-Proto", "").lower() == "https":
+        parts.append("Secure")
+    return "; ".join(parts), csrf_token
+
+
 def get_cookie_value(handler: BaseHTTPRequestHandler, name: str) -> str:
     raw_cookie = handler.headers.get("Cookie", "")
     if not raw_cookie:
@@ -484,15 +520,33 @@ def get_cookie_value(handler: BaseHTTPRequestHandler, name: str) -> str:
     return morsel.value if morsel else ""
 
 
-def has_valid_session(handler: BaseHTTPRequestHandler) -> bool:
+def parse_session_token(handler: BaseHTTPRequestHandler) -> Optional[tuple[str, int, str]]:
     token = get_cookie_value(handler, SESSION_COOKIE_NAME)
     if not token:
-        return False
+        return None
     try:
         username, expires_raw, signature = token.split(":", 2)
         expires_at = int(expires_raw)
     except ValueError:
+        return None
+    return username, expires_at, signature
+
+
+def current_csrf_token(handler: BaseHTTPRequestHandler) -> str:
+    parsed = parse_session_token(handler)
+    if not parsed:
+        return ""
+    username, expires_at, signature = parsed
+    if not hmac.compare_digest(signature, sign_session(username, expires_at)):
+        return ""
+    return sign_csrf(username, expires_at)
+
+
+def has_valid_session(handler: BaseHTTPRequestHandler) -> bool:
+    parsed = parse_session_token(handler)
+    if not parsed:
         return False
+    username, expires_at, signature = parsed
     if username != ADMIN_USERNAME:
         return False
     if expires_at < int(datetime.now(timezone.utc).timestamp()):
@@ -511,6 +565,42 @@ def require_admin_auth(handler: BaseHTTPRequestHandler) -> bool:
         headers={"Cache-Control": "no-store"},
     )
     return False
+
+
+def same_origin_request(handler: BaseHTTPRequestHandler) -> bool:
+    proto = handler.headers.get("X-Forwarded-Proto", "") or "http"
+    host = handler.headers.get("Host", "")
+    target_origin = f"{proto}://{host}" if host else ""
+    for header_name in ("Origin", "Referer"):
+        value = handler.headers.get(header_name, "")
+        if not value:
+            continue
+        return value.startswith(target_origin)
+    return True
+
+
+def require_csrf(handler: BaseHTTPRequestHandler) -> bool:
+    if not same_origin_request(handler):
+        log_alert("csrf_origin_blocked", ip=get_client_ip(handler), path=handler.path)
+        json_response(
+            handler,
+            HTTPStatus.FORBIDDEN,
+            {"error": "请求来源无效。"},
+            headers={"Cache-Control": "no-store"},
+        )
+        return False
+    expected = current_csrf_token(handler)
+    provided = handler.headers.get("X-CSRF-Token", "").strip()
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        log_alert("csrf_token_blocked", ip=get_client_ip(handler), path=handler.path)
+        json_response(
+            handler,
+            HTTPStatus.FORBIDDEN,
+            {"error": "安全校验失败，请刷新后台后重试。"},
+            headers={"Cache-Control": "no-store"},
+        )
+        return False
+    return True
 
 
 def send_file(
@@ -598,6 +688,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 {
                     "authenticated": authenticated,
                     "username": ADMIN_USERNAME if authenticated else "",
+                    "csrfToken": current_csrf_token(self) if authenticated else "",
                 },
                 headers={"Cache-Control": "no-store"},
             )
@@ -612,6 +703,8 @@ class AppHandler(BaseHTTPRequestHandler):
             )
         if parsed.path == "/api/export.csv":
             if not require_admin_auth(self):
+                return
+            if not require_csrf(self):
                 return
             return export_csv(self)
         if parsed.path.startswith("/assets/"):
@@ -657,29 +750,40 @@ class AppHandler(BaseHTTPRequestHandler):
             allowed, retry_after = check_rate_limit(self, "login")
             if not allowed:
                 log_event("warning", "login_rate_limited", ip=get_client_ip(self))
+                log_alert("login_rate_limited", ip=get_client_ip(self))
                 return self._respond_rate_limited(retry_after)
             payload = read_json(self)
             username = str(payload.get("username", "")).strip()
             password = str(payload.get("password", "")).strip()
             if not secrets.compare_digest(username, ADMIN_USERNAME) or not secrets.compare_digest(password, ADMIN_PASSWORD):
                 log_event("warning", "login_failed", ip=get_client_ip(self), username=username[:64])
+                log_alert("login_failed", ip=get_client_ip(self), username=username[:64])
                 return json_response(
                     self,
                     HTTPStatus.UNAUTHORIZED,
                     {"error": "账号或密码不正确。"},
                     headers={"Cache-Control": "no-store"},
                 )
+            session_cookie, csrf_token = build_session_artifacts(self, ADMIN_USERNAME)
             return json_response(
                 self,
                 HTTPStatus.OK,
-                {"ok": True, "username": ADMIN_USERNAME},
+                {
+                    "ok": True,
+                    "username": ADMIN_USERNAME,
+                    "csrfToken": csrf_token,
+                },
                 headers={
-                    "Set-Cookie": build_session_cookie(self, ADMIN_USERNAME),
+                    "Set-Cookie": session_cookie,
                     "Cache-Control": "no-store",
                 },
             )
 
         if parsed.path == "/api/admin/logout":
+            if not require_admin_auth(self):
+                return
+            if not require_csrf(self):
+                return
             return json_response(
                 self,
                 HTTPStatus.OK,
@@ -719,6 +823,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if not require_admin_auth(self):
+            return
+        if not require_csrf(self):
             return
 
         tail = parsed.path.removeprefix("/api/submissions/").strip("/")
