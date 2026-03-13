@@ -594,8 +594,6 @@
     const resultLead = document.getElementById("resultLead");
     const captchaWrap = document.getElementById("captchaWrap");
     const captchaNote = document.getElementById("captchaNote");
-    const LOCAL_SUBMISSION_LOCK_KEY = "jiayuan_last_submission";
-    const LOCAL_SUBMISSION_LOCK_MS = 1000 * 60 * 30;
     let turnstileEnabled = false;
     let turnstileSiteKey = "";
     let turnstileToken = "";
@@ -632,11 +630,6 @@
         }
         return;
       }
-      if (isLocallyLocked(payload.femalePhone)) {
-        setStatus("你刚刚已经提交过了，请不要重复提交，专业医生会尽快联系你。", true);
-        return;
-      }
-
       submitBtn.disabled = true;
       submitBtn.textContent = "正在提交...";
 
@@ -652,7 +645,6 @@
           throw new Error(data.error || "提交失败，请稍后再试。");
         }
 
-        rememberSubmissionLock(payload.femalePhone);
         resetTurnstile();
         renderResult(data.result, payload.femaleName);
       } catch (error) {
@@ -830,37 +822,6 @@
       window.turnstile.reset(turnstileWidgetId);
     }
 
-    function rememberSubmissionLock(phone) {
-      try {
-        localStorage.setItem(LOCAL_SUBMISSION_LOCK_KEY, JSON.stringify({
-          phone,
-          expiresAt: Date.now() + LOCAL_SUBMISSION_LOCK_MS
-        }));
-      } catch (error) {
-        // ignore local storage failures
-      }
-    }
-
-    function isLocallyLocked(phone) {
-      try {
-        const raw = localStorage.getItem(LOCAL_SUBMISSION_LOCK_KEY);
-        if (!raw) {
-          return false;
-        }
-        const data = JSON.parse(raw);
-        if (!data || !data.phone || !data.expiresAt) {
-          localStorage.removeItem(LOCAL_SUBMISSION_LOCK_KEY);
-          return false;
-        }
-        if (Date.now() > Number(data.expiresAt)) {
-          localStorage.removeItem(LOCAL_SUBMISSION_LOCK_KEY);
-          return false;
-        }
-        return data.phone === phone;
-      } catch (error) {
-        return false;
-      }
-    }
   </script>
 </body>
 </html>

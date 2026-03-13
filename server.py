@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import threading
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +44,7 @@ ADMIN_PATH = BASE_DIR / "admin.html"
 ASSETS_DIR = BASE_DIR / "assets"
 LOG_DIR = DB_DIR / "logs"
 BACKUP_DIR = DB_DIR / "backups"
+ARCHIVE_DIR = DB_DIR / "archives"
 ALERTS_LOG_PATH = LOG_DIR / "alerts.log"
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me-before-deploy").strip() or "change-me-before-deploy"
@@ -63,6 +64,7 @@ DEFAULT_SESSION_SECRET = "local-dev-session-secret".encode("utf-8")
 BACKUP_INTERVAL_SECONDS = 60 * 60 * 6
 MAX_BACKUP_FILES = 20
 DUPLICATE_PHONE_WINDOW_SECONDS = 60 * 60 * 12
+MAX_SUBMISSIONS_PER_PHONE_WINDOW = 10
 ADMIN_PAGE_SIZE = 50
 SUSPICIOUS_IP_WINDOW_SECONDS = 60 * 30
 SUSPICIOUS_IP_THRESHOLD = 3
@@ -91,12 +93,14 @@ def ensure_db() -> None:
     DB_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS submissions (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT '',
               name TEXT NOT NULL,
               phone TEXT NOT NULL,
               ip_address TEXT NOT NULL DEFAULT '',
@@ -113,6 +117,7 @@ def ensure_db() -> None:
               score_level TEXT NOT NULL,
               is_suspicious INTEGER NOT NULL DEFAULT 0,
               suspicion_reason TEXT NOT NULL DEFAULT '',
+              correction_count INTEGER NOT NULL DEFAULT 0,
               payload_json TEXT NOT NULL
             )
             """
@@ -122,10 +127,12 @@ def ensure_db() -> None:
             for row in conn.execute("PRAGMA table_info(submissions)").fetchall()
         }
         for column_name, definition in (
+            ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ("ip_address", "TEXT NOT NULL DEFAULT ''"),
             ("user_agent", "TEXT NOT NULL DEFAULT ''"),
             ("is_suspicious", "INTEGER NOT NULL DEFAULT 0"),
             ("suspicion_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("correction_count", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column_name not in existing_columns:
                 conn.execute(f"ALTER TABLE submissions ADD COLUMN {column_name} {definition}")
@@ -507,73 +514,144 @@ def assess_submission_risk(payload: dict, metadata: dict[str, str]) -> tuple[boo
 
 def save_submission(payload: dict, result: dict, metadata: dict[str, str], is_suspicious: bool, suspicion_reason: str) -> None:
     created_at = utc_iso()
+    phone = str(payload["femalePhone"]).strip()
+    name = str(payload["femaleName"]).strip()
+    ip_address = metadata.get("ip_address", "")
+    user_agent = metadata.get("user_agent", "")
+    female_age = int(float(payload["femaleAge"]))
+    female_weight = float(payload["femaleWeight"])
+    pregnancy_history = int(payload["pregnancyHistory"])
+    estrogen = parse_optional_number(payload.get("estrogen"))
+    progesterone = parse_optional_number(payload.get("progesterone"))
+    hcg = parse_optional_number(payload.get("hcg"))
+    male_age = int(float(payload["maleAge"]))
+    male_weight = float(payload["maleWeight"])
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
     with db_connection() as conn:
         conn.execute(
             """
             INSERT INTO submissions (
-              created_at, name, phone, ip_address, user_agent, female_age, female_weight, pregnancy_history,
+              created_at, updated_at, name, phone, ip_address, user_agent, female_age, female_weight, pregnancy_history,
               estrogen, progesterone, hcg, male_age, male_weight, score_range,
-              score_level, is_suspicious, suspicion_reason, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              score_level, is_suspicious, suspicion_reason, correction_count, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created_at,
-                str(payload["femaleName"]).strip(),
-                str(payload["femalePhone"]).strip(),
-                metadata.get("ip_address", ""),
-                metadata.get("user_agent", ""),
-                int(float(payload["femaleAge"])),
-                float(payload["femaleWeight"]),
-                int(payload["pregnancyHistory"]),
-                parse_optional_number(payload.get("estrogen")),
-                parse_optional_number(payload.get("progesterone")),
-                parse_optional_number(payload.get("hcg")),
-                int(float(payload["maleAge"])),
-                float(payload["maleWeight"]),
+                "",
+                name,
+                phone,
+                ip_address,
+                user_agent,
+                female_age,
+                female_weight,
+                pregnancy_history,
+                estrogen,
+                progesterone,
+                hcg,
+                male_age,
+                male_weight,
                 result["range"],
                 result["level"],
                 1 if is_suspicious else 0,
                 suspicion_reason,
-                json.dumps(payload, ensure_ascii=False),
+                0,
+                payload_json,
             ),
         )
     maybe_backup_db("submission_saved")
 
 
 def count_all_submissions(suspicious_only: bool = False) -> int:
-    with db_connection() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS count FROM submissions WHERE is_suspicious = ?",
-            (1 if suspicious_only else 0,),
-        ).fetchone()
-    return int(row["count"]) if row else 0
+    return count_submissions(suspicious_only=suspicious_only, period="all")
 
 
-def count_today_submissions(suspicious_only: bool = False) -> int:
+def count_today_submissions(suspicious_only: bool = False, search: str = "") -> int:
     today = datetime.now(timezone.utc).date().isoformat()
+    search = normalize_search(search)
+    duplicate_clause = (
+        "phone IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
+        if suspicious_only
+        else "phone NOT IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
+    )
+    clauses = ["substr(created_at, 1, 10) = ?", duplicate_clause]
+    params: list = [today]
+    if search:
+        clauses.append("(name LIKE ? OR phone LIKE ?)")
+        keyword = f"%{search}%"
+        params.extend([keyword, keyword])
     with db_connection() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) AS count FROM submissions WHERE substr(created_at, 1, 10) = ? AND is_suspicious = ?",
-            (today, 1 if suspicious_only else 0),
+            f"SELECT COUNT(*) AS count FROM submissions WHERE {' AND '.join(clauses)}",
+            params,
         ).fetchone()
     return int(row["count"]) if row else 0
 
 
-def list_submissions(page: int = 1, page_size: int = ADMIN_PAGE_SIZE, suspicious_only: bool = False) -> list[dict]:
-    page = max(1, page)
-    page_size = max(1, min(page_size, ADMIN_PAGE_SIZE))
-    offset = (page - 1) * page_size
+def normalize_period(period: str) -> str:
+    value = (period or "all").strip().lower()
+    if value in {"recent30", "older30"}:
+        return value
+    return "all"
+
+
+def normalize_search(search: str) -> str:
+    return (search or "").strip()
+
+
+def build_submission_filter(
+    suspicious_only: bool = False,
+    period: str = "all",
+    search: str = "",
+) -> tuple[str, list]:
+    period = normalize_period(period)
+    search = normalize_search(search)
+    duplicate_clause = (
+        "phone IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
+        if suspicious_only
+        else "phone NOT IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
+    )
+    clauses = [duplicate_clause]
+    params: list = []
+
+    if period != "all":
+        cutoff = (now_utc() - timedelta(days=30)).isoformat()
+        clauses.append("created_at >= ?" if period == "recent30" else "created_at < ?")
+        params.append(cutoff)
+
+    if search:
+        clauses.append("(name LIKE ? OR phone LIKE ?)")
+        keyword = f"%{search}%"
+        params.extend([keyword, keyword])
+
+    return " AND ".join(clauses), params
+
+
+def fetch_submission_rows(
+    suspicious_only: bool = False,
+    period: str = "all",
+    search: str = "",
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
+    where_clause, params = build_submission_filter(suspicious_only=suspicious_only, period=period, search=search)
+    query = f"""
+        SELECT id, created_at, name, phone, female_age, female_weight, pregnancy_history,
+               male_age, male_weight, score_range, score_level, is_suspicious, suspicion_reason
+        FROM submissions
+        WHERE {where_clause}
+        ORDER BY id DESC
+    """
+    query_params: list = list(params)
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        query_params.extend([limit, max(0, offset)])
     with db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, created_at, name, phone, female_age, female_weight, pregnancy_history,
-                   male_age, male_weight, score_range, score_level, is_suspicious, suspicion_reason
-            FROM submissions
-            WHERE is_suspicious = ?
-            ORDER BY id DESC
-            LIMIT ? OFFSET ?
-            """
-        , (1 if suspicious_only else 0, page_size, offset)).fetchall()
+        return conn.execute(query, query_params).fetchall()
+
+
+def serialize_submission_rows(rows: list[sqlite3.Row]) -> list[dict]:
     return [
         {
             "id": row["id"],
@@ -594,6 +672,44 @@ def list_submissions(page: int = 1, page_size: int = ADMIN_PAGE_SIZE, suspicious
     ]
 
 
+def count_submissions(suspicious_only: bool = False, period: str = "all", search: str = "") -> int:
+    where_clause, params = build_submission_filter(suspicious_only=suspicious_only, period=period, search=search)
+    with db_connection() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM submissions WHERE {where_clause}",
+            params,
+        ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def list_submissions(page: int = 1, page_size: int = ADMIN_PAGE_SIZE, suspicious_only: bool = False) -> list[dict]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, ADMIN_PAGE_SIZE))
+    offset = (page - 1) * page_size
+    rows = fetch_submission_rows(suspicious_only=suspicious_only, limit=page_size, offset=offset)
+    return serialize_submission_rows(rows)
+
+
+def list_submissions_filtered(
+    page: int = 1,
+    page_size: int = ADMIN_PAGE_SIZE,
+    suspicious_only: bool = False,
+    period: str = "all",
+    search: str = "",
+) -> list[dict]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, ADMIN_PAGE_SIZE))
+    offset = (page - 1) * page_size
+    rows = fetch_submission_rows(
+        suspicious_only=suspicious_only,
+        period=period,
+        search=search,
+        limit=page_size,
+        offset=offset,
+    )
+    return serialize_submission_rows(rows)
+
+
 def delete_submission(submission_id: int) -> bool:
     with db_connection() as conn:
         cursor = conn.execute("DELETE FROM submissions WHERE id = ?", (submission_id,))
@@ -603,29 +719,20 @@ def delete_submission(submission_id: int) -> bool:
     return deleted
 
 
-def recent_submission_exists(phone: str, window_seconds: int = DUPLICATE_PHONE_WINDOW_SECONDS) -> bool:
+def delete_submissions(submission_ids: list[int]) -> int:
+    ids = sorted({int(item) for item in submission_ids if int(item) > 0})
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
     with db_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT created_at
-            FROM submissions
-            WHERE phone = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (phone,),
-        ).fetchone()
-    if not row:
-        return False
-    try:
-        created_at = datetime.fromisoformat(row["created_at"])
-    except (TypeError, ValueError):
-        return False
-    return (now_utc() - created_at).total_seconds() < window_seconds
+        cursor = conn.execute(f"DELETE FROM submissions WHERE id IN ({placeholders})", ids)
+        deleted_count = int(cursor.rowcount or 0)
+    if deleted_count:
+        maybe_backup_db("submission_bulk_deleted")
+    return deleted_count
 
 
-def export_csv(handler: BaseHTTPRequestHandler, suspicious_only: bool = False) -> None:
-    rows = list_submissions(suspicious_only=suspicious_only, page_size=5000)
+def rows_to_csv_bytes(rows: list[dict]) -> bytes:
     from io import StringIO
 
     buffer = StringIO()
@@ -646,8 +753,68 @@ def export_csv(handler: BaseHTTPRequestHandler, suspicious_only: bool = False) -
                 row["suspicion_reason"],
             ]
         )
+    return buffer.getvalue().encode("utf-8-sig")
 
-    body = buffer.getvalue().encode("utf-8-sig")
+
+def archive_old_submissions(suspicious_only: bool = False, period: str = "older30") -> tuple[int, str]:
+    rows = serialize_submission_rows(fetch_submission_rows(suspicious_only=suspicious_only, period=period))
+    if not rows:
+        return 0, ""
+
+    timestamp = now_utc().strftime("%Y%m%d-%H%M%S")
+    suffix = "suspicious" if suspicious_only else "normal"
+    archive_path = ARCHIVE_DIR / f"submissions-{suffix}-{period}-{timestamp}.csv"
+    archive_path.write_bytes(rows_to_csv_bytes(rows))
+
+    deleted_count = delete_submissions([row["id"] for row in rows])
+    if deleted_count != len(rows):
+        raise RuntimeError("归档过程中删除数量不一致，请检查数据状态。")
+
+    log_event(
+        "info",
+        "submissions_archived",
+        suspicious=suspicious_only,
+        period=period,
+        count=deleted_count,
+        archive_path=str(archive_path),
+    )
+    return deleted_count, str(archive_path)
+
+
+def recent_submission_count(phone: str, window_seconds: int = DUPLICATE_PHONE_WINDOW_SECONDS) -> int:
+    cutoff = (now_utc().timestamp() - window_seconds)
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT created_at
+            FROM submissions
+            WHERE phone = ?
+            ORDER BY id DESC
+            """,
+            (phone,),
+        ).fetchall()
+    count = 0
+    for row in rows:
+        try:
+            created_at = datetime.fromisoformat(row["created_at"])
+        except (TypeError, ValueError):
+            continue
+        if created_at.timestamp() >= cutoff:
+            count += 1
+    return count
+
+
+def recent_submission_exists(phone: str, window_seconds: int = DUPLICATE_PHONE_WINDOW_SECONDS) -> bool:
+    return recent_submission_count(phone, window_seconds) > 0
+
+
+def reached_phone_submission_limit(phone: str) -> bool:
+    return recent_submission_count(phone) >= MAX_SUBMISSIONS_PER_PHONE_WINDOW
+
+
+def export_csv(handler: BaseHTTPRequestHandler, suspicious_only: bool = False, period: str = "all", search: str = "") -> None:
+    rows = list_submissions_filtered(suspicious_only=suspicious_only, page_size=5000, period=period, search=search)
+    body = rows_to_csv_bytes(rows)
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", "text/csv; charset=utf-8")
     filename = "beijing-jiayuan-suspicious-leads.csv" if suspicious_only else "beijing-jiayuan-leads.csv"
@@ -902,24 +1069,36 @@ class AppHandler(BaseHTTPRequestHandler):
             page = 1
             page_size = ADMIN_PAGE_SIZE
             suspicious_only = (query.get("suspicious") or ["0"])[0] == "1"
+            period = normalize_period((query.get("period") or ["all"])[0])
+            search = normalize_search((query.get("search") or [""])[0])
             try:
                 page = int((query.get("page") or ["1"])[0])
             except (ValueError, IndexError):
                 page = 1
-            total = count_all_submissions(suspicious_only=suspicious_only)
+            total = count_submissions(suspicious_only=suspicious_only, period=period, search=search)
             return json_response(
                 self,
                 HTTPStatus.OK,
                 {
-                    "items": list_submissions(page=page, page_size=page_size, suspicious_only=suspicious_only),
+                    "items": list_submissions_filtered(
+                        page=page,
+                        page_size=page_size,
+                        suspicious_only=suspicious_only,
+                        period=period,
+                        search=search,
+                    ),
                     "page": max(1, page),
                     "pageSize": page_size,
                     "total": total,
-                    "todayCount": count_today_submissions(suspicious_only=suspicious_only),
+                    "todayCount": count_today_submissions(suspicious_only=suspicious_only, search=search),
                     "hasNext": total > max(1, page) * page_size,
                     "suspicious": suspicious_only,
-                    "normalCount": count_all_submissions(suspicious_only=False),
-                    "suspiciousCount": count_all_submissions(suspicious_only=True),
+                    "period": period,
+                    "search": search,
+                    "recent30Count": count_submissions(suspicious_only=suspicious_only, period="recent30", search=search),
+                    "older30Count": count_submissions(suspicious_only=suspicious_only, period="older30", search=search),
+                    "normalCount": count_submissions(suspicious_only=False, period="all", search=search),
+                    "suspiciousCount": count_submissions(suspicious_only=True, period="all", search=search),
                 },
                 headers={"Cache-Control": "no-store"},
             )
@@ -929,7 +1108,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if not require_csrf(self):
                 return
             suspicious_only = (query.get("suspicious") or ["0"])[0] == "1"
-            return export_csv(self, suspicious_only=suspicious_only)
+            period = normalize_period((query.get("period") or ["all"])[0])
+            search = normalize_search((query.get("search") or [""])[0])
+            return export_csv(self, suspicious_only=suspicious_only, period=period, search=search)
         if parsed.path.startswith("/assets/"):
             asset_path = (ASSETS_DIR / parsed.path.removeprefix("/assets/")).resolve()
             if ASSETS_DIR not in asset_path.parents and asset_path != ASSETS_DIR:
@@ -1017,6 +1198,53 @@ class AppHandler(BaseHTTPRequestHandler):
                 },
             )
 
+        if parsed.path == "/api/submissions/archive-older":
+            if not require_admin_auth(self):
+                return
+            if not require_csrf(self):
+                return
+            payload = read_json(self)
+            suspicious_only = bool(payload.get("suspicious"))
+            period = normalize_period(str(payload.get("period", "older30")))
+            if period != "older30":
+                return json_response(self, HTTPStatus.BAD_REQUEST, {"error": "当前只支持归档 30 天前的数据。"})
+            archived_count, archive_path = archive_old_submissions(suspicious_only=suspicious_only, period=period)
+            if not archived_count:
+                return json_response(self, HTTPStatus.OK, {"ok": True, "archivedCount": 0, "archivePath": ""})
+            return json_response(
+                self,
+                HTTPStatus.OK,
+                {"ok": True, "archivedCount": archived_count, "archivePath": archive_path},
+                headers={"Cache-Control": "no-store"},
+            )
+
+        if parsed.path == "/api/submissions/bulk-delete":
+            if not require_admin_auth(self):
+                return
+            if not require_csrf(self):
+                return
+            payload = read_json(self)
+            raw_ids = payload.get("ids", [])
+            if not isinstance(raw_ids, list):
+                return json_response(self, HTTPStatus.BAD_REQUEST, {"error": "请选择要删除的记录。"})
+            submission_ids: list[int] = []
+            for item in raw_ids:
+                try:
+                    submission_id = int(item)
+                except (TypeError, ValueError):
+                    return json_response(self, HTTPStatus.BAD_REQUEST, {"error": "存在无效的记录编号。"})
+                if submission_id > 0:
+                    submission_ids.append(submission_id)
+            if not submission_ids:
+                return json_response(self, HTTPStatus.BAD_REQUEST, {"error": "请选择要删除的记录。"})
+
+            deleted_count = delete_submissions(submission_ids)
+            if not deleted_count:
+                return json_response(self, HTTPStatus.NOT_FOUND, {"error": "选中的记录不存在或已经删除。"})
+
+            log_event("info", "submissions_bulk_deleted", ip=get_client_ip(self), count=deleted_count)
+            return json_response(self, HTTPStatus.OK, {"ok": True, "deletedCount": deleted_count})
+
         if parsed.path != "/api/assess":
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
@@ -1030,6 +1258,15 @@ class AppHandler(BaseHTTPRequestHandler):
         ok, message = validate_payload(payload)
         if not ok:
             return json_response(self, HTTPStatus.BAD_REQUEST, {"error": message})
+        phone = str(payload.get("femalePhone", "")).strip()
+        if reached_phone_submission_limit(phone):
+            log_event("info", "phone_submission_limit_reached", ip=get_client_ip(self), phone=phone[-4:])
+            return json_response(
+                self,
+                HTTPStatus.CONFLICT,
+                {"error": "这个手机号 12 小时内最多生成 10 次，请稍后再试。"},
+                headers={"Cache-Control": "no-store"},
+            )
         turnstile_ok, turnstile_message = validate_turnstile(
             str(payload.get("turnstileToken", "")),
             get_client_ip(self),
@@ -1039,16 +1276,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 self,
                 HTTPStatus.FORBIDDEN,
                 {"error": turnstile_message},
-                headers={"Cache-Control": "no-store"},
-            )
-
-        phone = str(payload.get("femalePhone", "")).strip()
-        if recent_submission_exists(phone):
-            log_event("info", "duplicate_submission_blocked", ip=get_client_ip(self))
-            return json_response(
-                self,
-                HTTPStatus.CONFLICT,
-                {"error": "这个手机号近期已经提交过了，请不要重复提交，专业医生会尽快联系你。"},
                 headers={"Cache-Control": "no-store"},
             )
 
