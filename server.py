@@ -4,14 +4,17 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import sqlite3
+import threading
+import traceback
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,13 +41,30 @@ DB_PATH = DB_DIR / "submissions.db"
 INDEX_PATH = BASE_DIR / "index.html"
 ADMIN_PATH = BASE_DIR / "admin.html"
 ASSETS_DIR = BASE_DIR / "assets"
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+LOG_DIR = DB_DIR / "logs"
+BACKUP_DIR = DB_DIR / "backups"
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me-before-deploy").strip() or "change-me-before-deploy"
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "local-dev-session-secret").encode("utf-8")
 SESSION_COOKIE_NAME = "jiayuan_admin_session"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
 PORT = int(os.environ.get("PORT", "4173"))
+APP_ENV = os.environ.get("APP_ENV", "").strip().lower()
+IS_PRODUCTION = APP_ENV == "production" or any(
+    os.environ.get(key)
+    for key in ("RENDER_EXTERNAL_HOSTNAME", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID")
+)
+DEFAULT_ADMIN_PASSWORD = "change-me-before-deploy"
+DEFAULT_SESSION_SECRET = "local-dev-session-secret".encode("utf-8")
+BACKUP_INTERVAL_SECONDS = 60 * 60 * 6
+MAX_BACKUP_FILES = 20
+
+RATE_LIMITS = {
+    "login": {"limit": 5, "window": 60 * 10},
+    "assess": {"limit": 15, "window": 60 * 5},
+}
+rate_limit_store: dict[str, list[float]] = {}
+rate_limit_lock = threading.Lock()
 
 
 PREGNANCY_LABELS = {
@@ -57,6 +77,8 @@ PREGNANCY_LABELS = {
 
 def ensure_db() -> None:
     DB_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -87,6 +109,69 @@ def db_connection() -> sqlite3.Connection:
     return conn
 
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_iso() -> str:
+    return now_utc().isoformat()
+
+
+def log_event(level: str, event: str, **details) -> None:
+    try:
+        payload = {
+            "timestamp": utc_iso(),
+            "level": level,
+            "event": event,
+            "details": details,
+        }
+        with (LOG_DIR / "app.log").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        # Logging should never break the request lifecycle.
+        return
+
+
+def latest_backup_age_seconds() -> Optional[float]:
+    backups = sorted(BACKUP_DIR.glob("submissions-*.db"))
+    if not backups:
+        return None
+    latest = backups[-1]
+    return now_utc().timestamp() - latest.stat().st_mtime
+
+
+def prune_old_backups() -> None:
+    backups = sorted(BACKUP_DIR.glob("submissions-*.db"))
+    for stale in backups[:-MAX_BACKUP_FILES]:
+        stale.unlink(missing_ok=True)
+
+
+def maybe_backup_db(reason: str) -> None:
+    if not DB_PATH.exists():
+        return
+    age = latest_backup_age_seconds()
+    if age is not None and age < BACKUP_INTERVAL_SECONDS:
+        return
+    stamp = now_utc().strftime("%Y%m%d-%H%M%S")
+    backup_path = BACKUP_DIR / f"submissions-{stamp}.db"
+    shutil.copy2(DB_PATH, backup_path)
+    prune_old_backups()
+    log_event("info", "db_backup_created", reason=reason, backup_path=str(backup_path))
+
+
+def validate_runtime_config() -> None:
+    issues = []
+    if not ADMIN_USERNAME:
+        issues.append("ADMIN_USERNAME 不能为空")
+    if IS_PRODUCTION and ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD:
+        issues.append("生产环境必须设置安全的 ADMIN_PASSWORD")
+    if IS_PRODUCTION and SESSION_SECRET == DEFAULT_SESSION_SECRET:
+        issues.append("生产环境必须设置安全的 SESSION_SECRET")
+    if issues:
+        message = "；".join(issues)
+        raise RuntimeError(message)
+
+
 def json_response(
     handler: BaseHTTPRequestHandler,
     status: int,
@@ -115,6 +200,28 @@ def read_json(handler: BaseHTTPRequestHandler) -> dict:
 
 def validate_phone(phone: str) -> bool:
     return len(phone) == 11 and phone.isdigit() and phone.startswith("1") and phone[1] in "3456789"
+
+
+def get_client_ip(handler: BaseHTTPRequestHandler) -> str:
+    forwarded = handler.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return handler.client_address[0]
+
+
+def check_rate_limit(handler: BaseHTTPRequestHandler, scope: str) -> tuple[bool, int]:
+    config = RATE_LIMITS[scope]
+    now_ts = now_utc().timestamp()
+    key = f"{scope}:{get_client_ip(handler)}"
+    with rate_limit_lock:
+        recent = [ts for ts in rate_limit_store.get(key, []) if now_ts - ts < config["window"]]
+        if len(recent) >= config["limit"]:
+            retry_after = max(1, int(config["window"] - (now_ts - recent[0])))
+            rate_limit_store[key] = recent
+            return False, retry_after
+        recent.append(now_ts)
+        rate_limit_store[key] = recent
+    return True, 0
 
 
 def parse_optional_number(value):
@@ -243,7 +350,7 @@ def calculate_result(payload: dict) -> dict:
 
 
 def save_submission(payload: dict, result: dict) -> None:
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at = utc_iso()
     with db_connection() as conn:
         conn.execute(
             """
@@ -270,6 +377,7 @@ def save_submission(payload: dict, result: dict) -> None:
                 json.dumps(payload, ensure_ascii=False),
             ),
         )
+    maybe_backup_db("submission_saved")
 
 
 def list_submissions() -> list[dict]:
@@ -303,7 +411,10 @@ def list_submissions() -> list[dict]:
 def delete_submission(submission_id: int) -> bool:
     with db_connection() as conn:
         cursor = conn.execute("DELETE FROM submissions WHERE id = ?", (submission_id,))
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+    if deleted:
+        maybe_backup_db("submission_deleted")
+    return deleted
 
 
 def export_csv(handler: BaseHTTPRequestHandler) -> None:
@@ -390,18 +501,8 @@ def has_valid_session(handler: BaseHTTPRequestHandler) -> bool:
     return hmac.compare_digest(signature, expected)
 
 
-def has_valid_admin_token(query: dict) -> bool:
-    if not ADMIN_TOKEN:
-        return False
-    provided = ""
-    if "token" in query and query["token"]:
-        provided = query["token"][0]
-    return secrets.compare_digest(provided, ADMIN_TOKEN)
-
-
-def require_admin_auth(handler: BaseHTTPRequestHandler, query: Optional[dict] = None) -> bool:
-    query = query or {}
-    if has_valid_session(handler) or has_valid_admin_token(query):
+def require_admin_auth(handler: BaseHTTPRequestHandler) -> bool:
+    if has_valid_session(handler):
         return True
     json_response(
         handler,
@@ -417,6 +518,7 @@ def send_file(
     file_path: Path,
     content_type: str,
     headers: Optional[dict[str, str]] = None,
+    include_body: bool = True,
 ) -> None:
     if not file_path.exists() or not file_path.is_file():
         handler.send_error(HTTPStatus.NOT_FOUND, "File not found")
@@ -429,13 +531,55 @@ def send_file(
         for key, value in headers.items():
             handler.send_header(key, value)
     handler.end_headers()
-    handler.wfile.write(body)
+    if include_body:
+        handler.wfile.write(body)
 
 
 class AppHandler(BaseHTTPRequestHandler):
+    def end_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; "
+            "frame-ancestors 'none'; form-action 'self'",
+        )
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        super().end_headers()
+
+    def _respond_rate_limited(self, retry_after: int) -> None:
+        json_response(
+            self,
+            HTTPStatus.TOO_MANY_REQUESTS,
+            {"error": "操作太频繁了，请稍后再试。"},
+            headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+        )
+
+    def _run_safely(self, method_name: str, handler_fn) -> None:
+        try:
+            handler_fn()
+        except BrokenPipeError:
+            log_event("warning", "client_disconnected", method=method_name, path=self.path)
+        except Exception as exc:
+            log_event(
+                "error",
+                "unhandled_exception",
+                method=method_name,
+                path=self.path,
+                error=str(exc),
+                traceback=traceback.format_exc()[-4000:],
+            )
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Server error")
+
     def do_GET(self) -> None:
+        self._run_safely("GET", self._handle_get)
+
+    def _handle_get(self) -> None:
         parsed = urlparse(self.path)
-        query = parse_qs(parsed.query)
 
         if parsed.path in ("/", "/index.html"):
             return send_file(self, INDEX_PATH, "text/html; charset=utf-8")
@@ -447,7 +591,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 headers={"Cache-Control": "no-store"},
             )
         if parsed.path == "/api/admin/session":
-            authenticated = has_valid_session(self) or has_valid_admin_token(query)
+            authenticated = has_valid_session(self)
             return json_response(
                 self,
                 HTTPStatus.OK,
@@ -458,7 +602,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 headers={"Cache-Control": "no-store"},
             )
         if parsed.path == "/api/submissions":
-            if not require_admin_auth(self, query):
+            if not require_admin_auth(self):
                 return
             return json_response(
                 self,
@@ -467,7 +611,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 headers={"Cache-Control": "no-store"},
             )
         if parsed.path == "/api/export.csv":
-            if not require_admin_auth(self, query):
+            if not require_admin_auth(self):
                 return
             return export_csv(self)
         if parsed.path.startswith("/assets/"):
@@ -485,13 +629,40 @@ class AppHandler(BaseHTTPRequestHandler):
 
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
+    def do_HEAD(self) -> None:
+        self._run_safely("HEAD", self._handle_head)
+
+    def _handle_head(self) -> None:
+        parsed = urlparse(self.path)
+
+        if parsed.path in ("/", "/index.html"):
+            return send_file(self, INDEX_PATH, "text/html; charset=utf-8", include_body=False)
+        if parsed.path in ("/admin", "/admin.html"):
+            return send_file(
+                self,
+                ADMIN_PATH,
+                "text/html; charset=utf-8",
+                headers={"Cache-Control": "no-store"},
+                include_body=False,
+            )
+
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
     def do_POST(self) -> None:
+        self._run_safely("POST", self._handle_post)
+
+    def _handle_post(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/admin/login":
+            allowed, retry_after = check_rate_limit(self, "login")
+            if not allowed:
+                log_event("warning", "login_rate_limited", ip=get_client_ip(self))
+                return self._respond_rate_limited(retry_after)
             payload = read_json(self)
             username = str(payload.get("username", "")).strip()
             password = str(payload.get("password", "")).strip()
             if not secrets.compare_digest(username, ADMIN_USERNAME) or not secrets.compare_digest(password, ADMIN_PASSWORD):
+                log_event("warning", "login_failed", ip=get_client_ip(self), username=username[:64])
                 return json_response(
                     self,
                     HTTPStatus.UNAUTHORIZED,
@@ -523,6 +694,11 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
 
+        allowed, retry_after = check_rate_limit(self, "assess")
+        if not allowed:
+            log_event("warning", "assessment_rate_limited", ip=get_client_ip(self))
+            return self._respond_rate_limited(retry_after)
+
         payload = read_json(self)
         ok, message = validate_payload(payload)
         if not ok:
@@ -530,16 +706,19 @@ class AppHandler(BaseHTTPRequestHandler):
 
         result = calculate_result(payload)
         save_submission(payload, result)
+        log_event("info", "assessment_saved", ip=get_client_ip(self))
         json_response(self, HTTPStatus.OK, {"result": result})
 
     def do_DELETE(self) -> None:
+        self._run_safely("DELETE", self._handle_delete)
+
+    def _handle_delete(self) -> None:
         parsed = urlparse(self.path)
         if not parsed.path.startswith("/api/submissions/"):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
 
-        query = parse_qs(parsed.query)
-        if not require_admin_auth(self, query):
+        if not require_admin_auth(self):
             return
 
         tail = parsed.path.removeprefix("/api/submissions/").strip("/")
@@ -552,6 +731,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if not deleted:
             return json_response(self, HTTPStatus.NOT_FOUND, {"error": "这条记录不存在或已经删除。"})
 
+        log_event("info", "submission_deleted", ip=get_client_ip(self), submission_id=submission_id)
         json_response(self, HTTPStatus.OK, {"ok": True})
 
     def log_message(self, format: str, *args) -> None:
@@ -560,6 +740,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     ensure_db()
+    validate_runtime_config()
+    maybe_backup_db("startup")
+    log_event("info", "server_started", port=PORT, app_env=APP_ENV or "development", production=IS_PRODUCTION)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), AppHandler)
     print(f"Server running on http://127.0.0.1:{PORT}")
     server.serve_forever()

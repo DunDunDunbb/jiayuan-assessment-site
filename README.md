@@ -65,12 +65,14 @@ assets/wecom-card-placeholder.svg
 - 后端默认把 SQLite 数据库存到 `data/`
 - 如果部署平台支持持久化磁盘，可以设置环境变量 `DATA_DIR`
 - 正式部署建议设置：
+  - `APP_ENV=production`
   - `ADMIN_USERNAME`
   - `ADMIN_PASSWORD`
   - `SESSION_SECRET`
   - `DATA_DIR`
 - 当前目录已包含 `render.yaml`，适合直接部署到 Render 这类支持 Python Web Service 的平台
-- 如果你仍然需要兼容旧的口令方式，也可以继续设置 `ADMIN_TOKEN`
+- 生产环境下如果后台密码或会话密钥仍是默认值，服务会直接拒绝启动
+- 后台已移除 URL `token` 鉴权，只保留账号密码登录
 
 ## 旧文件
 
