@@ -331,7 +331,7 @@ def export_csv(handler: BaseHTTPRequestHandler) -> None:
     body = buffer.getvalue().encode("utf-8-sig")
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", "text/csv; charset=utf-8")
-    handler.send_header("Content-Disposition", 'attachment; filename="jiayuan-leads.csv"')
+    handler.send_header("Content-Disposition", 'attachment; filename="beijing-jiayuan-leads.csv"')
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
@@ -439,7 +439,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if parsed.path in ("/", "/index.html"):
             return send_file(self, INDEX_PATH, "text/html; charset=utf-8")
-        if parsed.path == "/admin":
+        if parsed.path in ("/admin", "/admin.html"):
             return send_file(
                 self,
                 ADMIN_PATH,
