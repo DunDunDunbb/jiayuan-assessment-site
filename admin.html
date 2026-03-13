@@ -662,7 +662,8 @@
 
       try {
         const suspicious = currentMode === "suspicious" ? 1 : 0;
-        const response = await fetch(`/api/submissions?page=${currentPage}&suspicious=${suspicious}&period=${currentPeriod}&search=${encodeURIComponent(currentSearch)}`, {
+        const searchOnly = currentSearch ? 1 : 0;
+        const response = await fetch(`/api/submissions?page=${currentPage}&suspicious=${suspicious}&period=${currentPeriod}&search=${encodeURIComponent(currentSearch)}&search_only=${searchOnly}`, {
           headers: { "Cache-Control": "no-store" }
         });
         const data = await response.json();
@@ -702,18 +703,20 @@
       latestTime.textContent = items.length ? formatTime(items[0].created_at) : "-";
       currentPage = data.page || 1;
       hasNextPage = Boolean(data.hasNext);
-      pageInfo.textContent = `${currentMode === "suspicious" ? "重复手机号用户" : "正常提交用户"} · ${periodLabel(currentPeriod)} · ${currentSearch ? `搜索“${currentSearch}” · ` : ""}第 ${currentPage} 页 · 每页 ${data.pageSize || 50} 条`;
+      pageInfo.textContent = currentSearch
+        ? `搜索结果“${currentSearch}” · 第 ${currentPage} 页 · 每页 ${data.pageSize || 50} 条`
+        : `${currentMode === "suspicious" ? "重复手机号用户" : "正常提交用户"} · ${periodLabel(currentPeriod)} · 第 ${currentPage} 页 · 每页 ${data.pageSize || 50} 条`;
       prevPageBtn.disabled = currentPage <= 1;
       nextPageBtn.disabled = !hasNextPage;
-      normalModeBtn.disabled = currentMode === "normal";
-      suspiciousModeBtn.disabled = currentMode === "suspicious";
-      allPeriodBtn.disabled = currentPeriod === "all";
-      recent30Btn.disabled = currentPeriod === "recent30";
-      older30Btn.disabled = currentPeriod === "older30";
-      archiveOlderBtn.disabled = (data.older30Count || 0) === 0;
+      normalModeBtn.disabled = Boolean(currentSearch) || currentMode === "normal";
+      suspiciousModeBtn.disabled = Boolean(currentSearch) || currentMode === "suspicious";
+      allPeriodBtn.disabled = Boolean(currentSearch) || currentPeriod === "all";
+      recent30Btn.disabled = Boolean(currentSearch) || currentPeriod === "recent30";
+      older30Btn.disabled = Boolean(currentSearch) || currentPeriod === "older30";
+      archiveOlderBtn.disabled = Boolean(currentSearch) || (data.older30Count || 0) === 0;
 
       if (!items.length) {
-        tableBody.innerHTML = '<tr><td class="empty" colspan="9">还没有提交记录。</td></tr>';
+        tableBody.innerHTML = `<tr><td class="empty" colspan="9">${currentSearch ? "没有搜到匹配记录。" : "还没有提交记录。"}</td></tr>`;
         updateSelectionUi();
         return;
       }
@@ -809,7 +812,8 @@
 
       try {
         const suspicious = currentMode === "suspicious" ? 1 : 0;
-        const response = await fetch(`/api/export.csv?suspicious=${suspicious}&period=${currentPeriod}&search=${encodeURIComponent(currentSearch)}`, {
+        const searchOnly = currentSearch ? 1 : 0;
+        const response = await fetch(`/api/export.csv?suspicious=${suspicious}&period=${currentPeriod}&search=${encodeURIComponent(currentSearch)}&search_only=${searchOnly}`, {
           method: "GET",
           headers: authHeaders()
         });

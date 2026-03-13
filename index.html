@@ -460,8 +460,8 @@
             <div class="grid">
               <div class="field" data-error-for="femaleName">
                 <label class="label" for="femaleName">姓名 <span class="required">*</span></label>
-                <input id="femaleName" type="text" placeholder="请输入联系人姓名">
-                <div class="field-error">请填写姓名。</div>
+                <input id="femaleName" type="text" maxlength="24" placeholder="请输入联系人姓名">
+                <div class="field-error">请输入姓名。</div>
               </div>
 
               <div class="field" data-error-for="femalePhone">
@@ -607,6 +607,22 @@
       { id: "maleWeight", min: 45, max: 150 }
     ];
 
+    function isValidChineseName(value) {
+      const normalized = String(value || "").trim();
+      if (!normalized) {
+        return false;
+      }
+      if (!/^[\u3400-\u9fff]+(?:·[\u3400-\u9fff]+)*$/u.test(normalized)) {
+        return false;
+      }
+      const plainName = normalized.replaceAll("·", "");
+      if (/([\u3400-\u9fff])\1\1/u.test(plainName)) {
+        return false;
+      }
+      const nameLength = plainName.length;
+      return nameLength >= 2 && nameLength <= 6;
+    }
+
     window.onTurnstileLoad = function onTurnstileLoad() {
       turnstileScriptReady = true;
       maybeRenderTurnstile();
@@ -665,7 +681,7 @@
     });
 
     document.getElementById("femaleName").addEventListener("blur", () => {
-      if (!document.getElementById("femaleName").value.trim()) {
+      if (!isValidChineseName(document.getElementById("femaleName").value)) {
         showError("femaleName");
       } else {
         clearError("femaleName");
@@ -710,7 +726,7 @@
     function validate(data) {
       let valid = true;
 
-      if (!data.femaleName) {
+      if (!isValidChineseName(data.femaleName)) {
         showError("femaleName");
         valid = false;
       }

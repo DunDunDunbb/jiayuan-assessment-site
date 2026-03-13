@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -87,6 +88,9 @@ PREGNANCY_LABELS = {
     10: "有过两次及以上怀孕经历",
     4: "有妊娠经历，同时伴随流产史",
 }
+
+CHINESE_NAME_RE = re.compile(r"^[\u3400-\u9fff]+(?:·[\u3400-\u9fff]+)*$")
+TRIPLE_REPEAT_HAN_RE = re.compile(r"([\u3400-\u9fff])\1\1")
 
 
 def ensure_db() -> None:
@@ -322,11 +326,23 @@ def parse_optional_number(value):
         return None
 
 
+def validate_chinese_name(name: str) -> bool:
+    normalized = (name or "").strip()
+    if not normalized or not CHINESE_NAME_RE.fullmatch(normalized):
+        return False
+    if TRIPLE_REPEAT_HAN_RE.search(normalized.replace("·", "")):
+        return False
+    name_length = len(normalized.replace("·", ""))
+    return 2 <= name_length <= 6
+
+
 def validate_payload(payload: dict) -> tuple[bool, str]:
     name = str(payload.get("femaleName", "")).strip()
     phone = str(payload.get("femalePhone", "")).strip()
     if not name:
-        return False, "请填写姓名。"
+        return False, "请输入姓名。"
+    if not validate_chinese_name(name):
+        return False, "请输入姓名。"
     if not validate_phone(phone):
         return False, "请输入有效的 11 位手机号。"
 
@@ -563,20 +579,28 @@ def save_submission(payload: dict, result: dict, metadata: dict[str, str], is_su
     maybe_backup_db("submission_saved")
 
 
+def build_duplicate_clause(duplicate_mode: str) -> Optional[str]:
+    mode = (duplicate_mode or "normal").strip().lower()
+    if mode == "duplicate":
+        return "phone IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
+    if mode == "all":
+        return None
+    return "phone NOT IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
+
+
 def count_all_submissions(suspicious_only: bool = False) -> int:
     return count_submissions(suspicious_only=suspicious_only, period="all")
 
 
-def count_today_submissions(suspicious_only: bool = False, search: str = "") -> int:
+def count_today_submissions(suspicious_only: bool = False, search: str = "", duplicate_mode: Optional[str] = None) -> int:
     today = datetime.now(timezone.utc).date().isoformat()
     search = normalize_search(search)
-    duplicate_clause = (
-        "phone IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
-        if suspicious_only
-        else "phone NOT IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
-    )
-    clauses = ["substr(created_at, 1, 10) = ?", duplicate_clause]
+    mode = duplicate_mode or ("duplicate" if suspicious_only else "normal")
+    duplicate_clause = build_duplicate_clause(mode)
+    clauses = ["substr(created_at, 1, 10) = ?"]
     params: list = [today]
+    if duplicate_clause:
+        clauses.append(duplicate_clause)
     if search:
         clauses.append("(name LIKE ? OR phone LIKE ?)")
         keyword = f"%{search}%"
@@ -604,15 +628,13 @@ def build_submission_filter(
     suspicious_only: bool = False,
     period: str = "all",
     search: str = "",
+    duplicate_mode: Optional[str] = None,
 ) -> tuple[str, list]:
     period = normalize_period(period)
     search = normalize_search(search)
-    duplicate_clause = (
-        "phone IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
-        if suspicious_only
-        else "phone NOT IN (SELECT phone FROM submissions GROUP BY phone HAVING COUNT(*) > 1)"
-    )
-    clauses = [duplicate_clause]
+    mode = duplicate_mode or ("duplicate" if suspicious_only else "normal")
+    duplicate_clause = build_duplicate_clause(mode)
+    clauses = [duplicate_clause] if duplicate_clause else []
     params: list = []
 
     if period != "all":
@@ -625,17 +647,23 @@ def build_submission_filter(
         keyword = f"%{search}%"
         params.extend([keyword, keyword])
 
-    return " AND ".join(clauses), params
+    return (" AND ".join(clauses) if clauses else "1 = 1"), params
 
 
 def fetch_submission_rows(
     suspicious_only: bool = False,
     period: str = "all",
     search: str = "",
+    duplicate_mode: Optional[str] = None,
     limit: Optional[int] = None,
     offset: int = 0,
 ) -> list[sqlite3.Row]:
-    where_clause, params = build_submission_filter(suspicious_only=suspicious_only, period=period, search=search)
+    where_clause, params = build_submission_filter(
+        suspicious_only=suspicious_only,
+        period=period,
+        search=search,
+        duplicate_mode=duplicate_mode,
+    )
     query = f"""
         SELECT id, created_at, name, phone, female_age, female_weight, pregnancy_history,
                male_age, male_weight, score_range, score_level, is_suspicious, suspicion_reason
@@ -672,8 +700,18 @@ def serialize_submission_rows(rows: list[sqlite3.Row]) -> list[dict]:
     ]
 
 
-def count_submissions(suspicious_only: bool = False, period: str = "all", search: str = "") -> int:
-    where_clause, params = build_submission_filter(suspicious_only=suspicious_only, period=period, search=search)
+def count_submissions(
+    suspicious_only: bool = False,
+    period: str = "all",
+    search: str = "",
+    duplicate_mode: Optional[str] = None,
+) -> int:
+    where_clause, params = build_submission_filter(
+        suspicious_only=suspicious_only,
+        period=period,
+        search=search,
+        duplicate_mode=duplicate_mode,
+    )
     with db_connection() as conn:
         row = conn.execute(
             f"SELECT COUNT(*) AS count FROM submissions WHERE {where_clause}",
@@ -696,6 +734,7 @@ def list_submissions_filtered(
     suspicious_only: bool = False,
     period: str = "all",
     search: str = "",
+    duplicate_mode: Optional[str] = None,
 ) -> list[dict]:
     page = max(1, page)
     page_size = max(1, min(page_size, ADMIN_PAGE_SIZE))
@@ -704,6 +743,7 @@ def list_submissions_filtered(
         suspicious_only=suspicious_only,
         period=period,
         search=search,
+        duplicate_mode=duplicate_mode,
         limit=page_size,
         offset=offset,
     )
@@ -812,8 +852,20 @@ def reached_phone_submission_limit(phone: str) -> bool:
     return recent_submission_count(phone) >= MAX_SUBMISSIONS_PER_PHONE_WINDOW
 
 
-def export_csv(handler: BaseHTTPRequestHandler, suspicious_only: bool = False, period: str = "all", search: str = "") -> None:
-    rows = list_submissions_filtered(suspicious_only=suspicious_only, page_size=5000, period=period, search=search)
+def export_csv(
+    handler: BaseHTTPRequestHandler,
+    suspicious_only: bool = False,
+    period: str = "all",
+    search: str = "",
+    duplicate_mode: Optional[str] = None,
+) -> None:
+    rows = list_submissions_filtered(
+        suspicious_only=suspicious_only,
+        page_size=5000,
+        period=period,
+        search=search,
+        duplicate_mode=duplicate_mode,
+    )
     body = rows_to_csv_bytes(rows)
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", "text/csv; charset=utf-8")
@@ -1071,11 +1123,19 @@ class AppHandler(BaseHTTPRequestHandler):
             suspicious_only = (query.get("suspicious") or ["0"])[0] == "1"
             period = normalize_period((query.get("period") or ["all"])[0])
             search = normalize_search((query.get("search") or [""])[0])
+            search_only = (query.get("search_only") or ["0"])[0] == "1" and bool(search)
+            duplicate_mode = "all" if search_only else ("duplicate" if suspicious_only else "normal")
+            items_period = "all" if search_only else period
             try:
                 page = int((query.get("page") or ["1"])[0])
             except (ValueError, IndexError):
                 page = 1
-            total = count_submissions(suspicious_only=suspicious_only, period=period, search=search)
+            total = count_submissions(
+                suspicious_only=suspicious_only,
+                period=items_period,
+                search=search,
+                duplicate_mode=duplicate_mode,
+            )
             return json_response(
                 self,
                 HTTPStatus.OK,
@@ -1084,21 +1144,47 @@ class AppHandler(BaseHTTPRequestHandler):
                         page=page,
                         page_size=page_size,
                         suspicious_only=suspicious_only,
-                        period=period,
+                        period=items_period,
                         search=search,
+                        duplicate_mode=duplicate_mode,
                     ),
                     "page": max(1, page),
                     "pageSize": page_size,
                     "total": total,
-                    "todayCount": count_today_submissions(suspicious_only=suspicious_only, search=search),
+                    "todayCount": count_today_submissions(
+                        suspicious_only=suspicious_only,
+                        search=search,
+                        duplicate_mode=duplicate_mode,
+                    ),
                     "hasNext": total > max(1, page) * page_size,
                     "suspicious": suspicious_only,
                     "period": period,
                     "search": search,
-                    "recent30Count": count_submissions(suspicious_only=suspicious_only, period="recent30", search=search),
-                    "older30Count": count_submissions(suspicious_only=suspicious_only, period="older30", search=search),
-                    "normalCount": count_submissions(suspicious_only=False, period="all", search=search),
-                    "suspiciousCount": count_submissions(suspicious_only=True, period="all", search=search),
+                    "searchOnly": search_only,
+                    "recent30Count": count_submissions(
+                        suspicious_only=suspicious_only,
+                        period="recent30",
+                        search=search,
+                        duplicate_mode=duplicate_mode,
+                    ),
+                    "older30Count": count_submissions(
+                        suspicious_only=suspicious_only,
+                        period="older30",
+                        search=search,
+                        duplicate_mode=duplicate_mode,
+                    ),
+                    "normalCount": count_submissions(
+                        suspicious_only=False,
+                        period="all",
+                        search=search,
+                        duplicate_mode="normal" if search_only else "normal",
+                    ),
+                    "suspiciousCount": count_submissions(
+                        suspicious_only=True,
+                        period="all",
+                        search=search,
+                        duplicate_mode="duplicate" if search_only else "duplicate",
+                    ),
                 },
                 headers={"Cache-Control": "no-store"},
             )
@@ -1110,7 +1196,16 @@ class AppHandler(BaseHTTPRequestHandler):
             suspicious_only = (query.get("suspicious") or ["0"])[0] == "1"
             period = normalize_period((query.get("period") or ["all"])[0])
             search = normalize_search((query.get("search") or [""])[0])
-            return export_csv(self, suspicious_only=suspicious_only, period=period, search=search)
+            search_only = (query.get("search_only") or ["0"])[0] == "1" and bool(search)
+            duplicate_mode = "all" if search_only else ("duplicate" if suspicious_only else "normal")
+            export_period = "all" if search_only else period
+            return export_csv(
+                self,
+                suspicious_only=suspicious_only,
+                period=export_period,
+                search=search,
+                duplicate_mode=duplicate_mode,
+            )
         if parsed.path.startswith("/assets/"):
             asset_path = (ASSETS_DIR / parsed.path.removeprefix("/assets/")).resolve()
             if ASSETS_DIR not in asset_path.parents and asset_path != ASSETS_DIR:
