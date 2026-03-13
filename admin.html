@@ -347,6 +347,8 @@
           <span>后台地址可以长期使用，退出后需要重新登录。</span>
         </div>
         <div class="toolbar-actions">
+          <button class="ghost" id="normalModeBtn" type="button">正常线索</button>
+          <button class="ghost" id="suspiciousModeBtn" type="button">可疑线索</button>
           <a class="link-btn ghost" id="exportBtn" href="/api/export.csv" target="_blank" rel="noreferrer">导出 CSV</a>
           <button class="ghost" id="refreshBtn" type="button">刷新数据</button>
           <button class="danger" id="logoutBtn" type="button">退出登录</button>
@@ -367,6 +369,10 @@
             <span>最近一次提交</span>
             <strong id="latestTime">-</strong>
           </div>
+          <div class="stat">
+            <span>可疑线索</span>
+            <strong id="countSuspicious">0</strong>
+          </div>
         </div>
         <div class="table-wrap">
           <table>
@@ -378,11 +384,12 @@
                 <th>结果区间</th>
                 <th>女方信息</th>
                 <th>男方信息</th>
+                <th>备注</th>
                 <th>操作</th>
               </tr>
             </thead>
             <tbody id="tableBody">
-              <tr><td class="empty" colspan="7">正在加载数据...</td></tr>
+              <tr><td class="empty" colspan="8">正在加载数据...</td></tr>
             </tbody>
           </table>
         </div>
@@ -408,17 +415,21 @@
     const refreshBtn = document.getElementById("refreshBtn");
     const logoutBtn = document.getElementById("logoutBtn");
     const exportBtn = document.getElementById("exportBtn");
+    const normalModeBtn = document.getElementById("normalModeBtn");
+    const suspiciousModeBtn = document.getElementById("suspiciousModeBtn");
     const welcomeText = document.getElementById("welcomeText");
     const tableBody = document.getElementById("tableBody");
     const countAll = document.getElementById("countAll");
     const countToday = document.getElementById("countToday");
     const latestTime = document.getElementById("latestTime");
+    const countSuspicious = document.getElementById("countSuspicious");
     const pageInfo = document.getElementById("pageInfo");
     const prevPageBtn = document.getElementById("prevPageBtn");
     const nextPageBtn = document.getElementById("nextPageBtn");
     let csrfToken = "";
     let currentPage = 1;
     let hasNextPage = false;
+    let currentMode = "normal";
 
     refreshBtn.addEventListener("click", loadData);
     logoutBtn.addEventListener("click", logout);
@@ -426,6 +437,8 @@
     loginForm.addEventListener("submit", login);
     prevPageBtn.addEventListener("click", () => changePage(-1));
     nextPageBtn.addEventListener("click", () => changePage(1));
+    normalModeBtn.addEventListener("click", () => switchMode("normal"));
+    suspiciousModeBtn.addEventListener("click", () => switchMode("suspicious"));
 
     bootstrap();
 
@@ -502,15 +515,17 @@
     function showLogin() {
       loginCard.classList.remove("hidden");
       dashboard.classList.add("hidden");
-      tableBody.innerHTML = '<tr><td class="empty" colspan="7">请先登录后台。</td></tr>';
+      tableBody.innerHTML = '<tr><td class="empty" colspan="8">请先登录后台。</td></tr>';
       countAll.textContent = "0";
       countToday.textContent = "0";
       latestTime.textContent = "-";
+      countSuspicious.textContent = "0";
       pageInfo.textContent = "第 1 页";
       prevPageBtn.disabled = true;
       nextPageBtn.disabled = true;
       currentPage = 1;
       hasNextPage = false;
+      currentMode = "normal";
       csrfToken = "";
       setLoginStatus("", false);
     }
@@ -527,10 +542,11 @@
     }
 
     async function loadData() {
-      tableBody.innerHTML = '<tr><td class="empty" colspan="7">正在加载数据...</td></tr>';
+      tableBody.innerHTML = '<tr><td class="empty" colspan="8">正在加载数据...</td></tr>';
 
       try {
-        const response = await fetch(`/api/submissions?page=${currentPage}`, {
+        const suspicious = currentMode === "suspicious" ? 1 : 0;
+        const response = await fetch(`/api/submissions?page=${currentPage}&suspicious=${suspicious}`, {
           headers: { "Cache-Control": "no-store" }
         });
         const data = await response.json();
@@ -544,10 +560,11 @@
         }
         renderTable(data);
       } catch (error) {
-        tableBody.innerHTML = `<tr><td class="error" colspan="7">${escapeHtml(error.message || "读取失败")}</td></tr>`;
+        tableBody.innerHTML = `<tr><td class="error" colspan="8">${escapeHtml(error.message || "读取失败")}</td></tr>`;
         countAll.textContent = "0";
         countToday.textContent = "0";
         latestTime.textContent = "-";
+        countSuspicious.textContent = "0";
         pageInfo.textContent = "读取失败";
         prevPageBtn.disabled = true;
         nextPageBtn.disabled = true;
@@ -558,15 +575,18 @@
       const items = data.items || [];
       countAll.textContent = String(data.total || 0);
       countToday.textContent = String(data.todayCount || 0);
+      countSuspicious.textContent = String(data.suspiciousCount || 0);
       latestTime.textContent = items.length ? formatTime(items[0].created_at) : "-";
       currentPage = data.page || 1;
       hasNextPage = Boolean(data.hasNext);
-      pageInfo.textContent = `第 ${currentPage} 页 · 每页 ${data.pageSize || 50} 条`;
+      pageInfo.textContent = `${currentMode === "suspicious" ? "可疑线索" : "正常线索"} · 第 ${currentPage} 页 · 每页 ${data.pageSize || 50} 条`;
       prevPageBtn.disabled = currentPage <= 1;
       nextPageBtn.disabled = !hasNextPage;
+      normalModeBtn.disabled = currentMode === "normal";
+      suspiciousModeBtn.disabled = currentMode === "suspicious";
 
       if (!items.length) {
-        tableBody.innerHTML = '<tr><td class="empty" colspan="7">还没有提交记录。</td></tr>';
+        tableBody.innerHTML = '<tr><td class="empty" colspan="8">还没有提交记录。</td></tr>';
         return;
       }
 
@@ -578,6 +598,7 @@
           <td>${escapeHtml(item.score_range || "-")}</td>
           <td>${escapeHtml(`年龄 ${item.female_age} / 体重 ${item.female_weight}kg / 孕史 ${item.pregnancy_history_label}`)}</td>
           <td>${escapeHtml(`年龄 ${item.male_age} / 体重 ${item.male_weight}kg`)}</td>
+          <td>${escapeHtml(item.suspicion_reason || "-")}</td>
           <td><button class="danger" type="button" onclick="deleteItem(${item.id})">删除</button></td>
         </tr>
       `).join("");
@@ -621,11 +642,18 @@
       loadData();
     }
 
+    function switchMode(mode) {
+      currentMode = mode;
+      currentPage = 1;
+      loadData();
+    }
+
     async function exportCsv(event) {
       event.preventDefault();
 
       try {
-        const response = await fetch("/api/export.csv", {
+        const suspicious = currentMode === "suspicious" ? 1 : 0;
+        const response = await fetch(`/api/export.csv?suspicious=${suspicious}`, {
           method: "GET",
           headers: authHeaders()
         });
@@ -642,7 +670,7 @@
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
-        link.download = "beijing-jiayuan-leads.csv";
+        link.download = currentMode === "suspicious" ? "beijing-jiayuan-suspicious-leads.csv" : "beijing-jiayuan-leads.csv";
         document.body.appendChild(link);
         link.click();
         link.remove();

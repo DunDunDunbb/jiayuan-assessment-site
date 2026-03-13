@@ -61,6 +61,10 @@ BACKUP_INTERVAL_SECONDS = 60 * 60 * 6
 MAX_BACKUP_FILES = 20
 DUPLICATE_PHONE_WINDOW_SECONDS = 60 * 60 * 12
 ADMIN_PAGE_SIZE = 50
+SUSPICIOUS_IP_WINDOW_SECONDS = 60 * 30
+SUSPICIOUS_IP_THRESHOLD = 3
+SUSPICIOUS_NAME_WINDOW_SECONDS = 60 * 60 * 24
+SUSPICIOUS_NAME_PHONE_THRESHOLD = 1
 
 RATE_LIMITS = {
     "login": {"limit": 5, "window": 60 * 10},
@@ -90,6 +94,8 @@ def ensure_db() -> None:
               created_at TEXT NOT NULL,
               name TEXT NOT NULL,
               phone TEXT NOT NULL,
+              ip_address TEXT NOT NULL DEFAULT '',
+              user_agent TEXT NOT NULL DEFAULT '',
               female_age INTEGER NOT NULL,
               female_weight REAL NOT NULL,
               pregnancy_history INTEGER NOT NULL,
@@ -100,10 +106,24 @@ def ensure_db() -> None:
               male_weight REAL NOT NULL,
               score_range TEXT NOT NULL,
               score_level TEXT NOT NULL,
+              is_suspicious INTEGER NOT NULL DEFAULT 0,
+              suspicion_reason TEXT NOT NULL DEFAULT '',
               payload_json TEXT NOT NULL
             )
             """
         )
+        existing_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(submissions)").fetchall()
+        }
+        for column_name, definition in (
+            ("ip_address", "TEXT NOT NULL DEFAULT ''"),
+            ("user_agent", "TEXT NOT NULL DEFAULT ''"),
+            ("is_suspicious", "INTEGER NOT NULL DEFAULT 0"),
+            ("suspicion_reason", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column_name not in existing_columns:
+                conn.execute(f"ALTER TABLE submissions ADD COLUMN {column_name} {definition}")
 
 
 def db_connection() -> sqlite3.Connection:
@@ -365,21 +385,97 @@ def calculate_result(payload: dict) -> dict:
     }
 
 
-def save_submission(payload: dict, result: dict) -> None:
+def submission_metadata_from_request(handler: BaseHTTPRequestHandler) -> dict[str, str]:
+    return {
+        "ip_address": get_client_ip(handler),
+        "user_agent": handler.headers.get("User-Agent", "")[:300],
+    }
+
+
+def recent_ip_submission_count(ip_address: str, window_seconds: int = SUSPICIOUS_IP_WINDOW_SECONDS) -> int:
+    if not ip_address:
+        return 0
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT created_at
+            FROM submissions
+            WHERE ip_address = ?
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (ip_address,),
+        ).fetchall()
+    count = 0
+    current = now_utc()
+    for row in rows:
+        try:
+            created_at = datetime.fromisoformat(row["created_at"])
+        except (TypeError, ValueError):
+            continue
+        if (current - created_at).total_seconds() < window_seconds:
+            count += 1
+    return count
+
+
+def recent_distinct_phone_count_for_name(name: str, window_seconds: int = SUSPICIOUS_NAME_WINDOW_SECONDS) -> int:
+    if not name:
+        return 0
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT phone, created_at
+            FROM submissions
+            WHERE name = ?
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (name,),
+        ).fetchall()
+    current = now_utc()
+    phones: set[str] = set()
+    for row in rows:
+        try:
+            created_at = datetime.fromisoformat(row["created_at"])
+        except (TypeError, ValueError):
+            continue
+        if (current - created_at).total_seconds() < window_seconds:
+            phones.add(str(row["phone"]))
+    return len(phones)
+
+
+def assess_submission_risk(payload: dict, metadata: dict[str, str]) -> tuple[bool, str]:
+    reasons: list[str] = []
+    ip_address = metadata.get("ip_address", "")
+    if recent_ip_submission_count(ip_address) >= SUSPICIOUS_IP_THRESHOLD:
+        reasons.append("同一网络短时间提交过多")
+
+    name = str(payload.get("femaleName", "")).strip()
+    phone = str(payload.get("femalePhone", "")).strip()
+    distinct_phone_count = recent_distinct_phone_count_for_name(name)
+    if distinct_phone_count >= SUSPICIOUS_NAME_PHONE_THRESHOLD and not recent_submission_exists(phone):
+        reasons.append("同名对应多个手机号")
+
+    return bool(reasons), "；".join(reasons)
+
+
+def save_submission(payload: dict, result: dict, metadata: dict[str, str], is_suspicious: bool, suspicion_reason: str) -> None:
     created_at = utc_iso()
     with db_connection() as conn:
         conn.execute(
             """
             INSERT INTO submissions (
-              created_at, name, phone, female_age, female_weight, pregnancy_history,
+              created_at, name, phone, ip_address, user_agent, female_age, female_weight, pregnancy_history,
               estrogen, progesterone, hcg, male_age, male_weight, score_range,
-              score_level, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              score_level, is_suspicious, suspicion_reason, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created_at,
                 str(payload["femaleName"]).strip(),
                 str(payload["femalePhone"]).strip(),
+                metadata.get("ip_address", ""),
+                metadata.get("user_agent", ""),
                 int(float(payload["femaleAge"])),
                 float(payload["femaleWeight"]),
                 int(payload["pregnancyHistory"]),
@@ -390,29 +486,34 @@ def save_submission(payload: dict, result: dict) -> None:
                 float(payload["maleWeight"]),
                 result["range"],
                 result["level"],
+                1 if is_suspicious else 0,
+                suspicion_reason,
                 json.dumps(payload, ensure_ascii=False),
             ),
         )
     maybe_backup_db("submission_saved")
 
 
-def count_all_submissions() -> int:
-    with db_connection() as conn:
-        row = conn.execute("SELECT COUNT(*) AS count FROM submissions").fetchone()
-    return int(row["count"]) if row else 0
-
-
-def count_today_submissions() -> int:
-    today = datetime.now(timezone.utc).date().isoformat()
+def count_all_submissions(suspicious_only: bool = False) -> int:
     with db_connection() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) AS count FROM submissions WHERE substr(created_at, 1, 10) = ?",
-            (today,),
+            "SELECT COUNT(*) AS count FROM submissions WHERE is_suspicious = ?",
+            (1 if suspicious_only else 0,),
         ).fetchone()
     return int(row["count"]) if row else 0
 
 
-def list_submissions(page: int = 1, page_size: int = ADMIN_PAGE_SIZE) -> list[dict]:
+def count_today_submissions(suspicious_only: bool = False) -> int:
+    today = datetime.now(timezone.utc).date().isoformat()
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM submissions WHERE substr(created_at, 1, 10) = ? AND is_suspicious = ?",
+            (today, 1 if suspicious_only else 0),
+        ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def list_submissions(page: int = 1, page_size: int = ADMIN_PAGE_SIZE, suspicious_only: bool = False) -> list[dict]:
     page = max(1, page)
     page_size = max(1, min(page_size, ADMIN_PAGE_SIZE))
     offset = (page - 1) * page_size
@@ -420,12 +521,13 @@ def list_submissions(page: int = 1, page_size: int = ADMIN_PAGE_SIZE) -> list[di
         rows = conn.execute(
             """
             SELECT id, created_at, name, phone, female_age, female_weight, pregnancy_history,
-                   male_age, male_weight, score_range, score_level
+                   male_age, male_weight, score_range, score_level, is_suspicious, suspicion_reason
             FROM submissions
+            WHERE is_suspicious = ?
             ORDER BY id DESC
             LIMIT ? OFFSET ?
             """
-        , (page_size, offset)).fetchall()
+        , (1 if suspicious_only else 0, page_size, offset)).fetchall()
     return [
         {
             "id": row["id"],
@@ -439,6 +541,8 @@ def list_submissions(page: int = 1, page_size: int = ADMIN_PAGE_SIZE) -> list[di
             "male_weight": row["male_weight"],
             "score_range": row["score_range"],
             "score_level": row["score_level"],
+            "is_suspicious": bool(row["is_suspicious"]),
+            "suspicion_reason": row["suspicion_reason"] or "",
         }
         for row in rows
     ]
@@ -474,13 +578,13 @@ def recent_submission_exists(phone: str, window_seconds: int = DUPLICATE_PHONE_W
     return (now_utc() - created_at).total_seconds() < window_seconds
 
 
-def export_csv(handler: BaseHTTPRequestHandler) -> None:
-    rows = list_submissions()
+def export_csv(handler: BaseHTTPRequestHandler, suspicious_only: bool = False) -> None:
+    rows = list_submissions(suspicious_only=suspicious_only, page_size=5000)
     from io import StringIO
 
     buffer = StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["提交时间", "姓名", "联系电话", "结果区间", "女方年龄", "女方体重", "既往怀孕情况", "男方年龄", "男方体重"])
+    writer.writerow(["提交时间", "姓名", "联系电话", "结果区间", "女方年龄", "女方体重", "既往怀孕情况", "男方年龄", "男方体重", "备注"])
     for row in rows:
         writer.writerow(
             [
@@ -493,13 +597,15 @@ def export_csv(handler: BaseHTTPRequestHandler) -> None:
                 row["pregnancy_history_label"],
                 row["male_age"],
                 row["male_weight"],
+                row["suspicion_reason"],
             ]
         )
 
     body = buffer.getvalue().encode("utf-8-sig")
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", "text/csv; charset=utf-8")
-    handler.send_header("Content-Disposition", 'attachment; filename="beijing-jiayuan-leads.csv"')
+    filename = "beijing-jiayuan-suspicious-leads.csv" if suspicious_only else "beijing-jiayuan-leads.csv"
+    handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
@@ -741,21 +847,25 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             page = 1
             page_size = ADMIN_PAGE_SIZE
+            suspicious_only = (query.get("suspicious") or ["0"])[0] == "1"
             try:
                 page = int((query.get("page") or ["1"])[0])
             except (ValueError, IndexError):
                 page = 1
-            total = count_all_submissions()
+            total = count_all_submissions(suspicious_only=suspicious_only)
             return json_response(
                 self,
                 HTTPStatus.OK,
                 {
-                    "items": list_submissions(page=page, page_size=page_size),
+                    "items": list_submissions(page=page, page_size=page_size, suspicious_only=suspicious_only),
                     "page": max(1, page),
                     "pageSize": page_size,
                     "total": total,
-                    "todayCount": count_today_submissions(),
+                    "todayCount": count_today_submissions(suspicious_only=suspicious_only),
                     "hasNext": total > max(1, page) * page_size,
+                    "suspicious": suspicious_only,
+                    "normalCount": count_all_submissions(suspicious_only=False),
+                    "suspiciousCount": count_all_submissions(suspicious_only=True),
                 },
                 headers={"Cache-Control": "no-store"},
             )
@@ -764,7 +874,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if not require_csrf(self):
                 return
-            return export_csv(self)
+            suspicious_only = (query.get("suspicious") or ["0"])[0] == "1"
+            return export_csv(self, suspicious_only=suspicious_only)
         if parsed.path.startswith("/assets/"):
             asset_path = (ASSETS_DIR / parsed.path.removeprefix("/assets/")).resolve()
             if ASSETS_DIR not in asset_path.parents and asset_path != ASSETS_DIR:
@@ -877,7 +988,11 @@ class AppHandler(BaseHTTPRequestHandler):
             )
 
         result = calculate_result(payload)
-        save_submission(payload, result)
+        metadata = submission_metadata_from_request(self)
+        is_suspicious, suspicion_reason = assess_submission_risk(payload, metadata)
+        if is_suspicious:
+            log_alert("suspicious_submission_isolated", ip=metadata.get("ip_address", ""), reason=suspicion_reason)
+        save_submission(payload, result, metadata, is_suspicious, suspicion_reason)
         log_event("info", "assessment_saved", ip=get_client_ip(self))
         json_response(self, HTTPStatus.OK, {"result": result})
 
