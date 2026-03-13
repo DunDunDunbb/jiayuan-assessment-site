@@ -14,7 +14,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -60,6 +60,7 @@ DEFAULT_SESSION_SECRET = "local-dev-session-secret".encode("utf-8")
 BACKUP_INTERVAL_SECONDS = 60 * 60 * 6
 MAX_BACKUP_FILES = 20
 DUPLICATE_PHONE_WINDOW_SECONDS = 60 * 60 * 12
+ADMIN_PAGE_SIZE = 50
 
 RATE_LIMITS = {
     "login": {"limit": 5, "window": 60 * 10},
@@ -395,7 +396,26 @@ def save_submission(payload: dict, result: dict) -> None:
     maybe_backup_db("submission_saved")
 
 
-def list_submissions() -> list[dict]:
+def count_all_submissions() -> int:
+    with db_connection() as conn:
+        row = conn.execute("SELECT COUNT(*) AS count FROM submissions").fetchone()
+    return int(row["count"]) if row else 0
+
+
+def count_today_submissions() -> int:
+    today = datetime.now(timezone.utc).date().isoformat()
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM submissions WHERE substr(created_at, 1, 10) = ?",
+            (today,),
+        ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def list_submissions(page: int = 1, page_size: int = ADMIN_PAGE_SIZE) -> list[dict]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, ADMIN_PAGE_SIZE))
+    offset = (page - 1) * page_size
     with db_connection() as conn:
         rows = conn.execute(
             """
@@ -403,8 +423,9 @@ def list_submissions() -> list[dict]:
                    male_age, male_weight, score_range, score_level
             FROM submissions
             ORDER BY id DESC
+            LIMIT ? OFFSET ?
             """
-        ).fetchall()
+        , (page_size, offset)).fetchall()
     return [
         {
             "id": row["id"],
@@ -692,6 +713,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _handle_get(self) -> None:
         parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
 
         if parsed.path in ("/", "/index.html"):
             return send_file(self, INDEX_PATH, "text/html; charset=utf-8")
@@ -717,10 +739,24 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/submissions":
             if not require_admin_auth(self):
                 return
+            page = 1
+            page_size = ADMIN_PAGE_SIZE
+            try:
+                page = int((query.get("page") or ["1"])[0])
+            except (ValueError, IndexError):
+                page = 1
+            total = count_all_submissions()
             return json_response(
                 self,
                 HTTPStatus.OK,
-                {"items": list_submissions()},
+                {
+                    "items": list_submissions(page=page, page_size=page_size),
+                    "page": max(1, page),
+                    "pageSize": page_size,
+                    "total": total,
+                    "todayCount": count_today_submissions(),
+                    "hasNext": total > max(1, page) * page_size,
+                },
                 headers={"Cache-Control": "no-store"},
             )
         if parsed.path == "/api/export.csv":

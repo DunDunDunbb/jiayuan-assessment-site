@@ -569,6 +569,8 @@
     const scoreBasis = document.getElementById("scoreBasis");
     const scoreAdvice = document.getElementById("scoreAdvice");
     const resultLead = document.getElementById("resultLead");
+    const LOCAL_SUBMISSION_LOCK_KEY = "jiayuan_last_submission";
+    const LOCAL_SUBMISSION_LOCK_MS = 1000 * 60 * 30;
 
     const rangedFields = [
       { id: "femaleAge", min: 20, max: 55 },
@@ -584,6 +586,10 @@
 
       const payload = collectFormData();
       if (!validate(payload)) {
+        return;
+      }
+      if (isLocallyLocked(payload.femalePhone)) {
+        setStatus("你刚刚已经提交过了，请不要重复提交，专业医生会尽快联系你。", true);
         return;
       }
 
@@ -602,6 +608,7 @@
           throw new Error(data.error || "提交失败，请稍后再试。");
         }
 
+        rememberSubmissionLock(payload.femalePhone);
         renderResult(data.result, payload.femaleName);
       } catch (error) {
         setStatus(error.message || "提交失败，请稍后再试。", true);
@@ -728,6 +735,38 @@
       resultLead.textContent = `${name} 已提交成功，专业医生会给你一对一咨询，下面是本次参考结果。`;
       resultBox.style.display = "block";
       resultBox.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    function rememberSubmissionLock(phone) {
+      try {
+        localStorage.setItem(LOCAL_SUBMISSION_LOCK_KEY, JSON.stringify({
+          phone,
+          expiresAt: Date.now() + LOCAL_SUBMISSION_LOCK_MS
+        }));
+      } catch (error) {
+        // ignore local storage failures
+      }
+    }
+
+    function isLocallyLocked(phone) {
+      try {
+        const raw = localStorage.getItem(LOCAL_SUBMISSION_LOCK_KEY);
+        if (!raw) {
+          return false;
+        }
+        const data = JSON.parse(raw);
+        if (!data || !data.phone || !data.expiresAt) {
+          localStorage.removeItem(LOCAL_SUBMISSION_LOCK_KEY);
+          return false;
+        }
+        if (Date.now() > Number(data.expiresAt)) {
+          localStorage.removeItem(LOCAL_SUBMISSION_LOCK_KEY);
+          return false;
+        }
+        return data.phone === phone;
+      } catch (error) {
+        return false;
+      }
     }
   </script>
 </body>

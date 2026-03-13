@@ -212,6 +212,21 @@
       overflow: hidden;
     }
 
+    .pagination {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 18px 20px;
+      border-top: 1px solid var(--line);
+      flex-wrap: wrap;
+    }
+
+    .pagination span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
     .stats {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -371,6 +386,13 @@
             </tbody>
           </table>
         </div>
+        <div class="pagination">
+          <span id="pageInfo">第 1 页</span>
+          <div class="toolbar-actions">
+            <button class="ghost" id="prevPageBtn" type="button">上一页</button>
+            <button class="ghost" id="nextPageBtn" type="button">下一页</button>
+          </div>
+        </div>
       </section>
     </section>
   </main>
@@ -391,12 +413,19 @@
     const countAll = document.getElementById("countAll");
     const countToday = document.getElementById("countToday");
     const latestTime = document.getElementById("latestTime");
+    const pageInfo = document.getElementById("pageInfo");
+    const prevPageBtn = document.getElementById("prevPageBtn");
+    const nextPageBtn = document.getElementById("nextPageBtn");
     let csrfToken = "";
+    let currentPage = 1;
+    let hasNextPage = false;
 
     refreshBtn.addEventListener("click", loadData);
     logoutBtn.addEventListener("click", logout);
     exportBtn.addEventListener("click", exportCsv);
     loginForm.addEventListener("submit", login);
+    prevPageBtn.addEventListener("click", () => changePage(-1));
+    nextPageBtn.addEventListener("click", () => changePage(1));
 
     bootstrap();
 
@@ -477,6 +506,11 @@
       countAll.textContent = "0";
       countToday.textContent = "0";
       latestTime.textContent = "-";
+      pageInfo.textContent = "第 1 页";
+      prevPageBtn.disabled = true;
+      nextPageBtn.disabled = true;
+      currentPage = 1;
+      hasNextPage = false;
       csrfToken = "";
       setLoginStatus("", false);
     }
@@ -496,7 +530,7 @@
       tableBody.innerHTML = '<tr><td class="empty" colspan="7">正在加载数据...</td></tr>';
 
       try {
-        const response = await fetch("/api/submissions", {
+        const response = await fetch(`/api/submissions?page=${currentPage}`, {
           headers: { "Cache-Control": "no-store" }
         });
         const data = await response.json();
@@ -508,20 +542,28 @@
         if (!response.ok) {
           throw new Error(data.error || "读取失败");
         }
-        renderTable(data.items);
+        renderTable(data);
       } catch (error) {
         tableBody.innerHTML = `<tr><td class="error" colspan="7">${escapeHtml(error.message || "读取失败")}</td></tr>`;
         countAll.textContent = "0";
         countToday.textContent = "0";
         latestTime.textContent = "-";
+        pageInfo.textContent = "读取失败";
+        prevPageBtn.disabled = true;
+        nextPageBtn.disabled = true;
       }
     }
 
-    function renderTable(items) {
-      countAll.textContent = String(items.length);
-      const today = new Date().toISOString().slice(0, 10);
-      countToday.textContent = String(items.filter((item) => item.created_at.startsWith(today)).length);
+    function renderTable(data) {
+      const items = data.items || [];
+      countAll.textContent = String(data.total || 0);
+      countToday.textContent = String(data.todayCount || 0);
       latestTime.textContent = items.length ? formatTime(items[0].created_at) : "-";
+      currentPage = data.page || 1;
+      hasNextPage = Boolean(data.hasNext);
+      pageInfo.textContent = `第 ${currentPage} 页 · 每页 ${data.pageSize || 50} 条`;
+      prevPageBtn.disabled = currentPage <= 1;
+      nextPageBtn.disabled = !hasNextPage;
 
       if (!items.length) {
         tableBody.innerHTML = '<tr><td class="empty" colspan="7">还没有提交记录。</td></tr>';
@@ -565,6 +607,18 @@
       } catch (error) {
         window.alert(error.message || "删除失败");
       }
+    }
+
+    function changePage(step) {
+      const nextPage = currentPage + step;
+      if (nextPage < 1) {
+        return;
+      }
+      if (step > 0 && !hasNextPage) {
+        return;
+      }
+      currentPage = nextPage;
+      loadData();
     }
 
     async function exportCsv(event) {
