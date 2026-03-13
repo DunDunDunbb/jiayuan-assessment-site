@@ -234,6 +234,24 @@
       margin-top: 28px;
     }
 
+    .captcha-wrap {
+      margin-top: 14px;
+      display: none;
+      gap: 10px;
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .captcha-wrap.active {
+      display: flex;
+    }
+
+    .captcha-note {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
     .submit-btn {
       width: 100%;
       border: 0;
@@ -517,6 +535,10 @@
 
           <div class="submit-area">
             <button class="submit-btn" id="submitBtn" type="submit">提交并生成参考结果</button>
+            <div class="captcha-wrap" id="captchaWrap">
+              <div id="turnstileWidget"></div>
+              <div class="captcha-note" id="captchaNote">提交前请完成人机验证。</div>
+            </div>
             <div class="status" id="formStatus"></div>
           </div>
         </form>
@@ -559,6 +581,7 @@
     </section>
   </main>
 
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileLoad" defer></script>
   <script>
     const form = document.getElementById("assessmentForm");
     const submitBtn = document.getElementById("submitBtn");
@@ -569,8 +592,15 @@
     const scoreBasis = document.getElementById("scoreBasis");
     const scoreAdvice = document.getElementById("scoreAdvice");
     const resultLead = document.getElementById("resultLead");
+    const captchaWrap = document.getElementById("captchaWrap");
+    const captchaNote = document.getElementById("captchaNote");
     const LOCAL_SUBMISSION_LOCK_KEY = "jiayuan_last_submission";
     const LOCAL_SUBMISSION_LOCK_MS = 1000 * 60 * 30;
+    let turnstileEnabled = false;
+    let turnstileSiteKey = "";
+    let turnstileToken = "";
+    let turnstileScriptReady = false;
+    let turnstileWidgetId = null;
 
     const rangedFields = [
       { id: "femaleAge", min: 20, max: 55 },
@@ -579,6 +609,13 @@
       { id: "maleWeight", min: 45, max: 150 }
     ];
 
+    window.onTurnstileLoad = function onTurnstileLoad() {
+      turnstileScriptReady = true;
+      maybeRenderTurnstile();
+    };
+
+    initPublicConfig();
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       clearErrors();
@@ -586,6 +623,13 @@
 
       const payload = collectFormData();
       if (!validate(payload)) {
+        return;
+      }
+      if (turnstileEnabled && !turnstileToken) {
+        setStatus("请先完成人机验证。", true);
+        if (window.turnstile && turnstileWidgetId !== null) {
+          window.turnstile.reset(turnstileWidgetId);
+        }
         return;
       }
       if (isLocallyLocked(payload.femalePhone)) {
@@ -600,7 +644,7 @@
         const response = await fetch("/api/assess", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          body: JSON.stringify({ ...payload, turnstileToken })
         });
 
         const data = await response.json();
@@ -609,6 +653,7 @@
         }
 
         rememberSubmissionLock(payload.femalePhone);
+        resetTurnstile();
         renderResult(data.result, payload.femaleName);
       } catch (error) {
         setStatus(error.message || "提交失败，请稍后再试。", true);
@@ -735,6 +780,54 @@
       resultLead.textContent = `${name} 已提交成功，专业医生会给你一对一咨询，下面是本次参考结果。`;
       resultBox.style.display = "block";
       resultBox.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    async function initPublicConfig() {
+      try {
+        const response = await fetch("/api/public-config", {
+          headers: { "Cache-Control": "no-store" }
+        });
+        const data = await response.json();
+        turnstileEnabled = Boolean(data.turnstileEnabled);
+        turnstileSiteKey = data.turnstileSiteKey || "";
+        if (turnstileEnabled) {
+          captchaWrap.classList.add("active");
+          maybeRenderTurnstile();
+        }
+      } catch (error) {
+        // ignore config failures and keep current flow
+      }
+    }
+
+    function maybeRenderTurnstile() {
+      if (!turnstileEnabled || !turnstileScriptReady || !window.turnstile || turnstileWidgetId !== null) {
+        return;
+      }
+      turnstileWidgetId = window.turnstile.render("#turnstileWidget", {
+        sitekey: turnstileSiteKey,
+        appearance: "interaction-only",
+        callback(token) {
+          turnstileToken = token;
+          captchaNote.textContent = "验证成功，可以提交。";
+        },
+        "expired-callback"() {
+          turnstileToken = "";
+          captchaNote.textContent = "验证已过期，请重新验证。";
+        },
+        "error-callback"() {
+          turnstileToken = "";
+          captchaNote.textContent = "验证失败，请稍后重试。";
+        }
+      });
+    }
+
+    function resetTurnstile() {
+      if (!turnstileEnabled || !window.turnstile || turnstileWidgetId === null) {
+        return;
+      }
+      turnstileToken = "";
+      captchaNote.textContent = "提交前请完成人机验证。";
+      window.turnstile.reset(turnstileWidgetId);
     }
 
     function rememberSubmissionLock(phone) {

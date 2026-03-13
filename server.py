@@ -14,7 +14,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -50,6 +51,8 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET", "local-dev-session-secret").en
 SESSION_COOKIE_NAME = "jiayuan_admin_session"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 14
 PORT = int(os.environ.get("PORT", "4173"))
+TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "").strip()
+TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "").strip()
 APP_ENV = os.environ.get("APP_ENV", "").strip().lower()
 IS_PRODUCTION = APP_ENV == "production" or any(
     os.environ.get(key)
@@ -65,6 +68,8 @@ SUSPICIOUS_IP_WINDOW_SECONDS = 60 * 30
 SUSPICIOUS_IP_THRESHOLD = 3
 SUSPICIOUS_NAME_WINDOW_SECONDS = 60 * 60 * 24
 SUSPICIOUS_NAME_PHONE_THRESHOLD = 1
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+TURNSTILE_ENABLED = bool(TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY)
 
 RATE_LIMITS = {
     "login": {"limit": 5, "window": 60 * 10},
@@ -203,6 +208,8 @@ def validate_runtime_config() -> None:
         issues.append("生产环境必须设置安全的 ADMIN_PASSWORD")
     if IS_PRODUCTION and SESSION_SECRET == DEFAULT_SESSION_SECRET:
         issues.append("生产环境必须设置安全的 SESSION_SECRET")
+    if bool(TURNSTILE_SITE_KEY) != bool(TURNSTILE_SECRET_KEY):
+        issues.append("TURNSTILE_SITE_KEY 和 TURNSTILE_SECRET_KEY 必须同时配置或同时留空")
     if issues:
         message = "；".join(issues)
         raise RuntimeError(message)
@@ -238,6 +245,13 @@ def validate_phone(phone: str) -> bool:
     return len(phone) == 11 and phone.isdigit() and phone.startswith("1") and phone[1] in "3456789"
 
 
+def public_config() -> dict:
+    return {
+        "turnstileEnabled": TURNSTILE_ENABLED,
+        "turnstileSiteKey": TURNSTILE_SITE_KEY if TURNSTILE_ENABLED else "",
+    }
+
+
 def get_client_ip(handler: BaseHTTPRequestHandler) -> str:
     forwarded = handler.headers.get("X-Forwarded-For", "")
     if forwarded:
@@ -258,6 +272,38 @@ def check_rate_limit(handler: BaseHTTPRequestHandler, scope: str) -> tuple[bool,
         recent.append(now_ts)
         rate_limit_store[key] = recent
     return True, 0
+
+
+def validate_turnstile(token: str, remote_ip: str) -> tuple[bool, str]:
+    if not TURNSTILE_ENABLED:
+        return True, ""
+    token = token.strip()
+    if not token:
+        return False, "请先完成人机验证。"
+    payload = urlencode(
+        {
+            "secret": TURNSTILE_SECRET_KEY,
+            "response": token,
+            "remoteip": remote_ip,
+        }
+    ).encode("utf-8")
+    request = Request(
+        TURNSTILE_VERIFY_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        log_alert("turnstile_verify_failed", error=str(exc), ip=remote_ip)
+        return False, "验证服务暂时不可用，请稍后再试。"
+    if data.get("success"):
+        return True, ""
+    error_codes = ",".join(data.get("error-codes", []))
+    log_alert("turnstile_rejected", ip=remote_ip, error_codes=error_codes or "unknown")
+    return False, "请先完成人机验证。"
 
 
 def parse_optional_number(value):
@@ -842,6 +888,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 },
                 headers={"Cache-Control": "no-store"},
             )
+        if parsed.path == "/api/public-config":
+            return json_response(
+                self,
+                HTTPStatus.OK,
+                public_config(),
+                headers={"Cache-Control": "no-store"},
+            )
         if parsed.path == "/api/submissions":
             if not require_admin_auth(self):
                 return
@@ -976,6 +1029,17 @@ class AppHandler(BaseHTTPRequestHandler):
         ok, message = validate_payload(payload)
         if not ok:
             return json_response(self, HTTPStatus.BAD_REQUEST, {"error": message})
+        turnstile_ok, turnstile_message = validate_turnstile(
+            str(payload.get("turnstileToken", "")),
+            get_client_ip(self),
+        )
+        if not turnstile_ok:
+            return json_response(
+                self,
+                HTTPStatus.FORBIDDEN,
+                {"error": turnstile_message},
+                headers={"Cache-Control": "no-store"},
+            )
 
         phone = str(payload.get("femalePhone", "")).strip()
         if recent_submission_exists(phone):

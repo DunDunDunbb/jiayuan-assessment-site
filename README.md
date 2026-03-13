@@ -70,9 +70,12 @@ assets/wecom-card-placeholder.svg
   - `ADMIN_PASSWORD`
   - `SESSION_SECRET`
   - `DATA_DIR`
+  - `TURNSTILE_SITE_KEY`（启用 Cloudflare Turnstile 时）
+  - `TURNSTILE_SECRET_KEY`（启用 Cloudflare Turnstile 时）
 - 当前目录已包含 `render.yaml`，适合直接部署到 Render 这类支持 Python Web Service 的平台
 - 生产环境下如果后台密码或会话密钥仍是默认值，服务会直接拒绝启动
 - 后台已移除 URL `token` 鉴权，只保留账号密码登录
+- 配置好 Turnstile 的 site key 和 secret key 后，前台会自动启用无感验证码
 
 ## 旧文件
 

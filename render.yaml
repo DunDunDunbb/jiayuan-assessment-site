@@ -21,3 +21,7 @@ services:
         sync: false
       - key: SESSION_SECRET
         generateValue: true
+      - key: TURNSTILE_SITE_KEY
+        sync: false
+      - key: TURNSTILE_SECRET_KEY
+        sync: false
