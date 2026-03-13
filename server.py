@@ -59,6 +59,7 @@ DEFAULT_ADMIN_PASSWORD = "change-me-before-deploy"
 DEFAULT_SESSION_SECRET = "local-dev-session-secret".encode("utf-8")
 BACKUP_INTERVAL_SECONDS = 60 * 60 * 6
 MAX_BACKUP_FILES = 20
+DUPLICATE_PHONE_WINDOW_SECONDS = 60 * 60 * 12
 
 RATE_LIMITS = {
     "login": {"limit": 5, "window": 60 * 10},
@@ -429,6 +430,27 @@ def delete_submission(submission_id: int) -> bool:
     if deleted:
         maybe_backup_db("submission_deleted")
     return deleted
+
+
+def recent_submission_exists(phone: str, window_seconds: int = DUPLICATE_PHONE_WINDOW_SECONDS) -> bool:
+    with db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT created_at
+            FROM submissions
+            WHERE phone = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (phone,),
+        ).fetchone()
+    if not row:
+        return False
+    try:
+        created_at = datetime.fromisoformat(row["created_at"])
+    except (TypeError, ValueError):
+        return False
+    return (now_utc() - created_at).total_seconds() < window_seconds
 
 
 def export_csv(handler: BaseHTTPRequestHandler) -> None:
@@ -807,6 +829,16 @@ class AppHandler(BaseHTTPRequestHandler):
         ok, message = validate_payload(payload)
         if not ok:
             return json_response(self, HTTPStatus.BAD_REQUEST, {"error": message})
+
+        phone = str(payload.get("femalePhone", "")).strip()
+        if recent_submission_exists(phone):
+            log_event("info", "duplicate_submission_blocked", ip=get_client_ip(self))
+            return json_response(
+                self,
+                HTTPStatus.CONFLICT,
+                {"error": "这个手机号近期已经提交过了，请不要重复提交，专业医生会尽快联系你。"},
+                headers={"Cache-Control": "no-store"},
+            )
 
         result = calculate_result(payload)
         save_submission(payload, result)
